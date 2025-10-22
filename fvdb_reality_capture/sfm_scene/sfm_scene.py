@@ -9,7 +9,7 @@ import numpy as np
 
 from ._load_colmap_scene import load_colmap_scene
 from .sfm_cache import SfmCache
-from .sfm_metadata import SfmCameraMetadata, SfmPosedImageMetadata
+from .sfm_metadata import SfmCameraMetadata, SfmCameraType, SfmPosedImageMetadata
 
 
 class SfmScene:
@@ -152,6 +152,184 @@ class SfmScene:
             transformation_matrix=None,
             cache=cache,
         )
+
+    def to_colmap(self, colmap_path: str | pathlib.Path, binary: bool = True) -> None:
+        """
+        Save the :class:`SfmScene` to a directory in the format of a COLMAP run.
+
+        .. note::
+            For cameras with distortion, the saved camera parameters will be the undistorted parameters
+            stored in :class:`SfmCameraMetadata` rather than the original distorted parameters. This is
+            because :class:`SfmCameraMetadata` stores undistorted intrinsics when distortion is present.
+            The distortion parameters will still be saved, but they may not exactly match the undistorted
+            intrinsics in the output.
+
+        Args:
+            colmap_path (str | pathlib.Path): The path where the COLMAP scene should be saved.
+            binary (bool): Whether to save in binary format (True) or text format (False). Defaults to True.
+        """
+        if isinstance(colmap_path, str):
+            colmap_path = pathlib.Path(colmap_path)
+
+        colmap_path.mkdir(parents=True, exist_ok=True)
+
+        # Import here to avoid circular imports
+        from ._colmap_utils import Camera as ColmapCamera
+        from ._colmap_utils import Image as ColmapImage
+        from ._colmap_utils import Quaternion, SceneManager
+
+        # Create sparse directory structure
+        sparse_path = colmap_path / "sparse" / "0"
+        sparse_path.mkdir(parents=True, exist_ok=True)
+
+        # Create a SceneManager to hold the data we'll write
+        scene_manager = SceneManager(str(sparse_path) + "/")
+
+        # Convert cameras from SfmCameraMetadata to COLMAP Camera format
+        for camera_id, camera_metadata in self._cameras.items():
+            camera_type = self._sfm_camera_type_to_colmap_int(camera_metadata.camera_type)
+            params = self._get_colmap_camera_params(camera_metadata)
+            colmap_camera = ColmapCamera(camera_type, camera_metadata.width, camera_metadata.height, params)
+            scene_manager.cameras[camera_id] = colmap_camera
+
+        # Convert images from SfmPosedImageMetadata to COLMAP Image format
+        # We need to extract quaternion and translation from world_to_camera matrix
+        for image_idx, image_metadata in enumerate(self._images):
+            # Extract rotation and translation from world_to_camera matrix
+            world_to_cam = image_metadata.world_to_camera_matrix
+            R = world_to_cam[:3, :3]  # Rotation matrix
+            t = world_to_cam[:3, 3]  # Translation vector
+
+            # Convert rotation matrix to quaternion
+            q = Quaternion.FromR(R)
+
+            # Get the image filename from the image_path
+            image_filename = pathlib.Path(image_metadata.image_path).name
+
+            # Create COLMAP Image object
+            colmap_image = ColmapImage(image_filename, image_metadata.camera_id, q, t)
+
+            # If we have point indices, we need to create dummy 2D points
+            # Since we don't have the actual 2D point coordinates, we'll create empty arrays
+            # or use dummy data if point_indices exist
+            if image_metadata.point_indices is not None and len(image_metadata.point_indices) > 0:
+                # Create dummy 2D points (we don't have the actual 2D coordinates in SfmScene)
+                # So we'll create empty arrays
+                colmap_image.points2D = np.empty((0, 2), dtype=np.float64)
+                colmap_image.point3D_ids = np.empty((0,), dtype=np.uint64)
+            else:
+                colmap_image.points2D = np.empty((0, 2), dtype=np.float64)
+                colmap_image.point3D_ids = np.empty((0,), dtype=np.uint64)
+
+            # Use image_idx as image_id (1-indexed in COLMAP)
+            image_id = image_idx + 1
+            scene_manager.images[image_id] = colmap_image
+            scene_manager.name_to_image_id[image_filename] = image_id
+
+        # Convert points to COLMAP format
+        num_points = len(self._points)
+        scene_manager.points3D = self._points.astype(np.float64)
+        scene_manager.point3D_ids = np.arange(num_points, dtype=np.uint64)
+        scene_manager.point3D_colors = self._points_rgb
+        scene_manager.point3D_errors = self._points_err.astype(np.float64)
+
+        # Build point3D_id_to_point3D_idx mapping
+        for i, point_id in enumerate(scene_manager.point3D_ids):
+            scene_manager.point3D_id_to_point3D_idx[point_id] = i
+
+        # Build point3D_id_to_images mapping if we have point indices
+        if self._has_point_indices:
+            # Initialize empty lists for each point
+            for point_id in scene_manager.point3D_ids:
+                scene_manager.point3D_id_to_images[point_id] = []
+
+            # For each image, add its visible points to the mapping
+            for image_idx, image_metadata in enumerate(self._images):
+                if image_metadata.point_indices is not None:
+                    image_id = image_idx + 1
+                    for point_idx in image_metadata.point_indices:
+                        if 0 <= point_idx < num_points:
+                            point_id = scene_manager.point3D_ids[point_idx]
+                            # Append (image_id, point2D_idx) - we use 0 as dummy point2D_idx
+                            scene_manager.point3D_id_to_images[point_id].append([image_id, 0])
+
+            # Convert lists to numpy arrays
+            for point_id in scene_manager.point3D_ids:
+                if len(scene_manager.point3D_id_to_images[point_id]) > 0:
+                    scene_manager.point3D_id_to_images[point_id] = np.array(
+                        scene_manager.point3D_id_to_images[point_id], dtype=np.uint32
+                    )
+                else:
+                    # Empty track
+                    scene_manager.point3D_id_to_images[point_id] = np.empty((0, 2), dtype=np.uint32)
+        else:
+            # No point indices available, create empty tracks for all points
+            for point_id in scene_manager.point3D_ids:
+                scene_manager.point3D_id_to_images[point_id] = np.empty((0, 2), dtype=np.uint32)
+
+        # Save the scene using SceneManager's save methods
+        scene_manager.save(str(sparse_path), binary=binary)
+
+        # Log success
+        self._logger.info(f"Saved COLMAP scene to {colmap_path}")
+
+    def _sfm_camera_type_to_colmap_int(self, sfm_camera_type: SfmCameraType) -> int:
+        """Convert SfmCameraType enum to COLMAP camera type integer."""
+        if sfm_camera_type == SfmCameraType.SIMPLE_PINHOLE:
+            return 0
+        elif sfm_camera_type == SfmCameraType.PINHOLE:
+            return 1
+        elif sfm_camera_type == SfmCameraType.SIMPLE_RADIAL:
+            return 2
+        elif sfm_camera_type == SfmCameraType.RADIAL:
+            return 3
+        elif sfm_camera_type == SfmCameraType.OPENCV:
+            return 4
+        elif sfm_camera_type == SfmCameraType.OPENCV_FISHEYE:
+            return 5
+        else:
+            raise ValueError(f"Unknown SfmCameraType {sfm_camera_type}")
+
+    def _get_colmap_camera_params(self, camera_metadata: SfmCameraMetadata) -> list[float]:
+        """Get COLMAP camera parameters from SfmCameraMetadata."""
+        camera_type = camera_metadata.camera_type
+        fx = camera_metadata.fx
+        fy = camera_metadata.fy
+        cx = camera_metadata.cx
+        cy = camera_metadata.cy
+        distortion = camera_metadata.distortion_parameters
+
+        if camera_type == SfmCameraType.SIMPLE_PINHOLE:
+            # SIMPLE_PINHOLE: f, cx, cy
+            return [fx, cx, cy]
+        elif camera_type == SfmCameraType.PINHOLE:
+            # PINHOLE: fx, fy, cx, cy
+            return [fx, fy, cx, cy]
+        elif camera_type == SfmCameraType.SIMPLE_RADIAL:
+            # SIMPLE_RADIAL: f, cx, cy, k1
+            k1 = distortion[0] if len(distortion) > 0 else 0.0
+            return [fx, cx, cy, k1]
+        elif camera_type == SfmCameraType.RADIAL:
+            # RADIAL: f, cx, cy, k1, k2
+            k1 = distortion[0] if len(distortion) > 0 else 0.0
+            k2 = distortion[1] if len(distortion) > 1 else 0.0
+            return [fx, cx, cy, k1, k2]
+        elif camera_type == SfmCameraType.OPENCV:
+            # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+            k1 = distortion[0] if len(distortion) > 0 else 0.0
+            k2 = distortion[1] if len(distortion) > 1 else 0.0
+            p1 = distortion[2] if len(distortion) > 2 else 0.0
+            p2 = distortion[3] if len(distortion) > 3 else 0.0
+            return [fx, fy, cx, cy, k1, k2, p1, p2]
+        elif camera_type == SfmCameraType.OPENCV_FISHEYE:
+            # OPENCV_FISHEYE: fx, fy, cx, cy, k1, k2, k3, k4
+            k1 = distortion[0] if len(distortion) > 0 else 0.0
+            k2 = distortion[1] if len(distortion) > 1 else 0.0
+            k3 = distortion[2] if len(distortion) > 2 else 0.0
+            k4 = distortion[3] if len(distortion) > 3 else 0.0
+            return [fx, fy, cx, cy, k1, k2, k3, k4]
+        else:
+            raise ValueError(f"Unknown camera type {camera_type}")
 
     @classmethod
     def from_e57(cls, e57_path: str | pathlib.Path, point_downsample_factor: int = 1) -> "SfmScene":

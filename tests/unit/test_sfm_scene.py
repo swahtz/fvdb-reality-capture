@@ -3,6 +3,8 @@
 #
 
 import pathlib
+import shutil
+import tempfile
 import unittest
 
 import cv2
@@ -253,6 +255,90 @@ class BasicSfmSceneTest(unittest.TestCase):
         state_dict = scene_no_points.state_dict()
         loaded_scene = SfmScene.from_state_dict(state_dict)
         self.assertTrue(sfm_scenes_match(scene_no_points, loaded_scene))
+
+    def test_to_colmap_roundtrip(self):
+        """Test that we can save a scene to COLMAP format and load it back."""
+        scene: SfmScene = SfmScene.from_colmap(self.dataset_path)
+        
+        # Create a temporary directory to save the COLMAP scene
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = pathlib.Path(tmpdir) / "test_colmap_output"
+            
+            # Save the scene to COLMAP format
+            scene.to_colmap(output_path, binary=True)
+            
+            # Verify the expected files were created
+            sparse_path = output_path / "sparse" / "0"
+            self.assertTrue(sparse_path.exists())
+            self.assertTrue((sparse_path / "cameras.bin").exists())
+            self.assertTrue((sparse_path / "images.bin").exists())
+            self.assertTrue((sparse_path / "points3D.bin").exists())
+            
+            # Load the scene back
+            loaded_scene = SfmScene.from_colmap(output_path)
+            
+            # Compare the original and loaded scenes
+            # Note: We can't use sfm_scenes_match directly because the cache paths will differ
+            self.assertEqual(len(loaded_scene.cameras), len(scene.cameras))
+            self.assertEqual(len(loaded_scene.images), len(scene.images))
+            self.assertEqual(len(loaded_scene.points), len(scene.points))
+            
+            # Check cameras
+            for camera_id in scene.cameras:
+                self.assertIn(camera_id, loaded_scene.cameras)
+                orig_cam = scene.cameras[camera_id]
+                loaded_cam = loaded_scene.cameras[camera_id]
+                self.assertEqual(orig_cam.width, loaded_cam.width)
+                self.assertEqual(orig_cam.height, loaded_cam.height)
+                self.assertEqual(orig_cam.camera_type, loaded_cam.camera_type)
+                # Note: Due to undistortion, focal lengths may differ slightly
+                self.assertTrue(np.allclose(orig_cam.fx, loaded_cam.fx, rtol=1e-3))
+                self.assertTrue(np.allclose(orig_cam.fy, loaded_cam.fy, rtol=1e-3))
+                self.assertTrue(np.allclose(orig_cam.cx, loaded_cam.cx, rtol=1e-3))
+                self.assertTrue(np.allclose(orig_cam.cy, loaded_cam.cy, rtol=1e-3))
+            
+            # Check images (poses)
+            self.assertTrue(np.allclose(
+                scene.camera_to_world_matrices, 
+                loaded_scene.camera_to_world_matrices,
+                rtol=1e-5
+            ))
+            self.assertTrue(np.allclose(
+                scene.world_to_camera_matrices,
+                loaded_scene.world_to_camera_matrices,
+                rtol=1e-5
+            ))
+            
+            # Check points
+            self.assertTrue(np.allclose(scene.points, loaded_scene.points, rtol=1e-6))
+            self.assertTrue(np.array_equal(scene.points_rgb, loaded_scene.points_rgb))
+            self.assertTrue(np.allclose(scene.points_err, loaded_scene.points_err, rtol=1e-6))
+
+    def test_to_colmap_text_format(self):
+        """Test that we can save a scene to COLMAP text format."""
+        scene: SfmScene = SfmScene.from_colmap(self.dataset_path)
+        
+        # Create a temporary directory to save the COLMAP scene
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = pathlib.Path(tmpdir) / "test_colmap_text_output"
+            
+            # Save the scene to COLMAP text format
+            scene.to_colmap(output_path, binary=False)
+            
+            # Verify the expected files were created
+            sparse_path = output_path / "sparse" / "0"
+            self.assertTrue(sparse_path.exists())
+            self.assertTrue((sparse_path / "cameras.txt").exists())
+            self.assertTrue((sparse_path / "images.txt").exists())
+            self.assertTrue((sparse_path / "points3D.txt").exists())
+            
+            # Load the scene back
+            loaded_scene = SfmScene.from_colmap(output_path)
+            
+            # Basic checks
+            self.assertEqual(len(loaded_scene.cameras), len(scene.cameras))
+            self.assertEqual(len(loaded_scene.images), len(scene.images))
+            self.assertEqual(len(loaded_scene.points), len(scene.points))
 
 
 if __name__ == "__main__":
