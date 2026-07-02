@@ -151,7 +151,7 @@ This release focuses on Gaussian splatting quality and performance, foundation-m
 
 *163 commits, ~150 files changed, 9 contributors.*
 
-This is the initial public release of fVDB Reality Capture, a toolbox built on top of fVDB for turning multi-view captures into 3D Gaussian splat reconstructions, meshes, and other derived assets. The release establishes the core pipeline end-to-end: loading COLMAP/e57/simple-directory SfM captures into a common `SfmScene` representation, training and refining 3D Gaussian splats on fVDB's `GaussianSplat3d`, extracting meshes via TSDF fusion, a `frgs` command-line tool, benchmarking utilities, foundation-model-assisted masking, and a full documentation and CI setup. (Note: earlier prototypes of a standalone viewer, multi-GPU training, and a GARField-style segmentation model — `GARfVDB` — were developed during this period but were removed/superseded before this release and do not ship in v0.3.0.)
+This is the initial public release of fVDB Reality Capture, a toolbox built on top of fVDB for turning multi-view captures into 3D Gaussian splat reconstructions, meshes, and other derived assets. The release establishes the core pipeline end-to-end: loading COLMAP/e57/simple-directory SfM captures into a common `SfmScene` representation, training and refining 3D Gaussian splats on fVDB's `GaussianSplat3d`, extracting meshes via TSDF fusion, a `frgs` command-line tool, benchmarking utilities, foundation-model-assisted masking, and a full documentation and CI setup.
 
 **Highlights:**
 - New `SfmScene`/`ColmapDataset` data model for loading and transforming COLMAP, e57, and plain-directory captures, with a composable torchvision-style transform pipeline and an on-disk caching layer.
