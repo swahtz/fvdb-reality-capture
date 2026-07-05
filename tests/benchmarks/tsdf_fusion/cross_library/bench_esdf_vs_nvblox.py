@@ -64,9 +64,17 @@ import torch
 import fvdb
 
 from mai_city_loader import load_mai_city_scene
+from sensitivity_utils import (
+    apply_gpu_mem_cap,
+    clip_scene_to_max_range,
+    precompute_lidar_range_images,
+    squat_nbytes,
+)
 
 
-NVBLOX_ENV_PYTHON = "/home/fwilliams/bin/miniconda3/envs/nvblox/bin/python"
+NVBLOX_ENV_PYTHON = os.environ.get(
+    "NVBLOX_ENV_PYTHON",
+    "/home/fwilliams/bin/miniconda3/envs/nvblox/bin/python")
 
 
 def _run_fvdb(
@@ -185,7 +193,8 @@ def _run_fvdb(
 
     peak_torch_gb = -1.0
     try:
-        peak_torch_gb = torch.cuda.max_memory_allocated() / 1e9
+        peak_torch_gb = (torch.cuda.max_memory_allocated()
+                         - squat_nbytes()) / 1e9
     except Exception:
         pass
 
@@ -222,26 +231,19 @@ def _run_nvblox(
     num_azimuth: int = 1800,
     num_elevation: int = 64,
     vertical_fov_rad: float = 0.4712,
+    max_integration_distance_m: float | None = None,
+    gpu_mem_cap_gb: float | None = None,
 ) -> dict[str, Any]:
     """Run nvblox ESDF via the dedicated-env subprocess."""
     runner = str(Path(__file__).resolve().parent / "nvblox_runner.py")
 
+    # Precomputed once per (scene, lidar intrinsics) and shared across
+    # every voxel size in the sweep (see
+    # sensitivity_utils.precompute_lidar_range_images).
+    range_imgs_npy, poses_npy = precompute_lidar_range_images(
+        scene, num_azimuth, num_elevation, vertical_fov_rad)
+
     with tempfile.TemporaryDirectory(prefix="nvblox_esdf_") as tmp:
-        # Mirror bench_mai_city's npz packaging so the nvblox subprocess
-        # can load the sweeps zero-copy.
-        pts_concat = np.concatenate(scene.points_per_frame, axis=0).astype(np.float32)
-        offsets = np.zeros(scene.n_frames + 1, dtype=np.int64)
-        offsets[1:] = np.cumsum([p.shape[0] for p in scene.points_per_frame])
-
-        npz_path = os.path.join(tmp, "mai_city_sweeps.npz")
-        np.savez(
-            npz_path,
-            points_per_frame_concat=pts_concat,
-            points_per_frame_offsets=offsets,
-            sensor_origins=scene.sensor_origins.astype(np.float32),
-            cam_to_world=scene.cam_to_world.astype(np.float32),
-        )
-
         spec = {
             "workload": "lidar",
             "voxel_size_m": voxel_size,
@@ -250,11 +252,18 @@ def _run_nvblox(
             "lidar_num_elevation": num_elevation,
             "lidar_vertical_fov_rad": vertical_fov_rad,
             "lidar_min_valid_range_m": 1.0,
-            "lidar_sweeps_npz": npz_path,
+            "lidar_range_images_npy": range_imgs_npy,
+            "lidar_poses_npy": poses_npy,
             "warmup_frames": 2,
             "with_esdf": True,
             "esdf_warm_calls": esdf_warm_calls,
         }
+        if max_integration_distance_m is not None:
+            spec["max_integration_distance_m"] = float(max_integration_distance_m)
+        if gpu_mem_cap_gb is not None and squat_nbytes() == 0:
+            # The driver's squat (if any) already constrains the whole
+            # device; capping again in the subprocess would double it.
+            spec["gpu_mem_cap_gb"] = float(gpu_mem_cap_gb)
         spec_path = os.path.join(tmp, "spec.json")
         out_path  = os.path.join(tmp, "result.json")
         with open(spec_path, "w") as f:
@@ -286,6 +295,8 @@ def _run_one_config(
     max_distance: float,
     esdf_warm_calls: int,
     skip_nvblox: bool,
+    nvblox_max_integration_distance_m: float | None = None,
+    gpu_mem_cap_gb: float | None = None,
 ) -> dict[str, Any]:
     """Run one (voxel_size, truncation, max_distance) config across
     both systems. Isolated per-config so OOM in one system doesn't
@@ -336,6 +347,8 @@ def _run_one_config(
         try:
             nvblox_result = _run_nvblox(
                 scene, voxel_size, truncation, max_distance, esdf_warm_calls,
+                max_integration_distance_m=nvblox_max_integration_distance_m,
+                gpu_mem_cap_gb=gpu_mem_cap_gb,
             )
             result["nvblox"] = nvblox_result
             if nvblox_result.get("ok", False):
@@ -430,7 +443,24 @@ def main() -> None:
                          "after the cold (first) call.")
     ap.add_argument("--skip-nvblox", action="store_true")
     ap.add_argument("--json-out", type=Path, default=None)
+    # --- Sensitivity-analysis knobs (see bench_mai_city.py) ---
+    ap.add_argument("--nvblox-python", type=str, default=None,
+                    help="python of the nvblox conda env (default: "
+                         "$NVBLOX_ENV_PYTHON or the install_nvblox.sh path)")
+    ap.add_argument("--nvblox-max-integration-distance-m", type=float,
+                    default=None,
+                    help="60 = paper's workload-matched config; omit for "
+                         "nvblox's upstream default (10 m)")
+    ap.add_argument("--max-range-m", type=float, default=None,
+                    help="radial clip on input points for the in-process "
+                         "fvdb run (nvblox clips internally)")
+    ap.add_argument("--gpu-mem-cap-gb", type=float, default=None,
+                    help="emulate a smaller GPU (51.5 = paper's 48 GB Ada)")
     args = ap.parse_args()
+
+    if args.nvblox_python is not None:
+        global NVBLOX_ENV_PYTHON
+        NVBLOX_ENV_PYTHON = args.nvblox_python
 
     # Build the list of configs to run.
     if args.voxel_sizes_m is not None:
@@ -459,6 +489,9 @@ def main() -> None:
     )
     print(f"[load] done. {scene.n_frames} frames, "
           f"{scene.total_points / 1e6:.2f} M points total")
+    if args.max_range_m is not None:
+        scene = clip_scene_to_max_range(scene, args.max_range_m)
+    apply_gpu_mem_cap(args.gpu_mem_cap_gb)
 
     results: list[dict[str, Any]] = []
     for cfg in configs:
@@ -469,6 +502,9 @@ def main() -> None:
             max_distance=cfg["max_distance"],
             esdf_warm_calls=args.esdf_warm_calls,
             skip_nvblox=args.skip_nvblox,
+            nvblox_max_integration_distance_m=(
+                args.nvblox_max_integration_distance_m),
+            gpu_mem_cap_gb=args.gpu_mem_cap_gb,
         ))
 
     print("")

@@ -56,6 +56,19 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mai_city_loader import load_mai_city_scene  # noqa: E402
+from sensitivity_utils import (  # noqa: E402
+    apply_gpu_mem_cap,
+    clip_scene_to_max_range,
+    precompute_lidar_range_images,
+    squat_nbytes,
+)
+
+# Python of the dedicated nvblox conda env (see install_nvblox.sh).
+# Overridable per-machine via the NVBLOX_ENV_PYTHON environment
+# variable or the --nvblox-python CLI flag.
+DEFAULT_NVBLOX_ENV_PYTHON = os.environ.get(
+    "NVBLOX_ENV_PYTHON",
+    "/home/fwilliams/bin/miniconda3/envs/nvblox/bin/python")
 
 
 def run_fvdb(scene, voxel_size: float, truncation: float,
@@ -164,7 +177,7 @@ def run_fvdb(scene, voxel_size: float, truncation: float,
                 "failure": f"runtime: {str(e).splitlines()[0][:140]}"}
 
     ms_per_f = (time.perf_counter() - t0) * 1000 / N
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_gb = (torch.cuda.max_memory_allocated() - squat_nbytes()) / 1e9
     return {
         "system": "fvdb" if batched else "fvdb_per_frame",
         "ok": True,
@@ -176,9 +189,11 @@ def run_fvdb(scene, voxel_size: float, truncation: float,
 
 
 def run_nvblox(scene, voxel_size: float, truncation: float,
-               nvblox_env_python: str = "/home/fwilliams/bin/miniconda3/envs/nvblox/bin/python",
+               nvblox_env_python: Optional[str] = None,
                num_azimuth: int = 1800, num_elevation: int = 64,
                vertical_fov_rad: float = 0.4712,  # ~27 deg for HDL-64
+               max_integration_distance_m: Optional[float] = None,
+               gpu_mem_cap_gb: Optional[float] = None,
                **_ignored) -> Dict[str, Any]:
     """Run NVIDIA nvblox's LiDAR TSDF integrator on a Mai City sweep
     sequence by spawning a subprocess into the `nvblox` conda env.
@@ -198,6 +213,14 @@ def run_nvblox(scene, voxel_size: float, truncation: float,
     """
     import os, subprocess, tempfile
 
+    # Minimise this process's device footprint while the subprocess
+    # runs: under --gpu-mem-cap-gb the driver's squat + leftovers and
+    # the nvblox subprocess share one emulated device.
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    if nvblox_env_python is None:
+        nvblox_env_python = DEFAULT_NVBLOX_ENV_PYTHON
     if not os.path.exists(nvblox_env_python):
         return {"system": "nvblox", "ok": False,
                 "failure": f"nvblox env python not found: {nvblox_env_python}"}
@@ -207,24 +230,15 @@ def run_nvblox(scene, voxel_size: float, truncation: float,
         return {"system": "nvblox", "ok": False,
                 "failure": f"nvblox_runner.py missing: {runner}"}
 
-    # Stash points + poses into an npz so the subprocess can load
-    # them zero-copy (JSON-encoding N x ~100k points is too slow).
+    # Precompute the spherical range images ONCE per (scene, lidar
+    # intrinsics) and share the .npy files across every voxel size in
+    # the sweep. Reprojecting all sweeps + re-writing a ~1 GB points
+    # npz in every per-voxel-size subprocess dominated nvblox bench
+    # wall time (~47 s overhead vs ~13 s integration per voxel size).
+    range_imgs_npy, poses_npy = precompute_lidar_range_images(
+        scene, num_azimuth, num_elevation, vertical_fov_rad)
+
     with tempfile.TemporaryDirectory(prefix="nvblox_bench_") as tmp:
-        # Concatenate all frames' points + build offsets for O(1)
-        # slicing on the nvblox side.
-        pts_concat = np.concatenate(scene.points_per_frame, axis=0).astype(np.float32)
-        offsets = np.zeros(scene.n_frames + 1, dtype=np.int64)
-        offsets[1:] = np.cumsum([p.shape[0] for p in scene.points_per_frame])
-
-        npz_path = os.path.join(tmp, "mai_city_sweeps.npz")
-        np.savez(
-            npz_path,
-            points_per_frame_concat=pts_concat,
-            points_per_frame_offsets=offsets,
-            sensor_origins=scene.sensor_origins.astype(np.float32),
-            cam_to_world=scene.cam_to_world.astype(np.float32),
-        )
-
         spec = {
             "workload": "lidar",
             "voxel_size_m": voxel_size,
@@ -233,9 +247,17 @@ def run_nvblox(scene, voxel_size: float, truncation: float,
             "lidar_num_elevation": num_elevation,
             "lidar_vertical_fov_rad": vertical_fov_rad,
             "lidar_min_valid_range_m": 1.0,
-            "lidar_sweeps_npz": npz_path,
+            "lidar_range_images_npy": range_imgs_npy,
+            "lidar_poses_npy": poses_npy,
             "warmup_frames": 2,
         }
+        if max_integration_distance_m is not None:
+            spec["max_integration_distance_m"] = float(max_integration_distance_m)
+        if gpu_mem_cap_gb is not None and squat_nbytes() == 0:
+            # Only cap inside the subprocess when this process hasn't
+            # already squatted the device down — capping on both sides
+            # would shrink the budget twice.
+            spec["gpu_mem_cap_gb"] = float(gpu_mem_cap_gb)
         spec_path = os.path.join(tmp, "spec.json")
         out_path = os.path.join(tmp, "result.json")
         with open(spec_path, "w") as f:
@@ -400,12 +422,36 @@ def main() -> None:
                    default=["fvdb", "vdbfusion"],
                    choices=["fvdb", "fvdb_per_frame", "vdbfusion", "nvblox"])
     p.add_argument("--json-out", type=str, default=None)
+    # --- Sensitivity-analysis knobs (nvblox-defaults ablation) ---
+    p.add_argument("--nvblox-python", type=str, default=None,
+                   help="python of the nvblox conda env (default: "
+                        "$NVBLOX_ENV_PYTHON or the install_nvblox.sh path)")
+    p.add_argument("--nvblox-max-integration-distance-m", type=float,
+                   default=None,
+                   help="nvblox lidar_projective_integrator_max_integration_"
+                        "distance_m. The paper's workload-matched config "
+                        "uses 60; omit to leave nvblox's upstream default "
+                        "(10 m) untouched.")
+    p.add_argument("--max-range-m", type=float, default=None,
+                   help="radially clip input points to this range for the "
+                        "in-process systems (fvdb / VDBFusion). Use 10 to "
+                        "match nvblox's upstream default integration range. "
+                        "nvblox is NOT pre-clipped; it enforces its own "
+                        "max integration distance internally.")
+    p.add_argument("--gpu-mem-cap-gb", type=float, default=None,
+                   help="emulate a smaller GPU by squatting device memory "
+                        "down to this total (decimal GB) in every measured "
+                        "process. 51.5 reproduces the paper's 48 GB "
+                        "RTX 6000 Ada (49140 MiB).")
     args = p.parse_args()
 
     max_frames = None if args.n_frames <= 0 else args.n_frames
     scene = load_mai_city_scene(
         args.root, sequence=args.sequence, max_frames=max_frames,
     )
+    if args.max_range_m is not None:
+        scene = clip_scene_to_max_range(scene, args.max_range_m)
+    apply_gpu_mem_cap(args.gpu_mem_cap_gb)
     traj_len = float(np.linalg.norm(
         np.diff(scene.sensor_origins, axis=0), axis=1).sum())
     print(f"Loaded Mai City seq={args.sequence!r}: "
@@ -428,7 +474,12 @@ def main() -> None:
             elif system == "vdbfusion":
                 r = run_vdbfusion(scene, vs, trunc)
             elif system == "nvblox":
-                r = run_nvblox(scene, vs, trunc)
+                r = run_nvblox(
+                    scene, vs, trunc,
+                    nvblox_env_python=args.nvblox_python,
+                    max_integration_distance_m=(
+                        args.nvblox_max_integration_distance_m),
+                    gpu_mem_cap_gb=args.gpu_mem_cap_gb)
             else:
                 continue
             r["voxel_size"] = vs

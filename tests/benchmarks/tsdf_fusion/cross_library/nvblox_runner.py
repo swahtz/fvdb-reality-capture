@@ -35,6 +35,12 @@ Spec format (JSON):
         "lidar_vertical_fov_rad": 0.4712,  # ~27 deg for HDL-64
         "lidar_min_valid_range_m": 1.0,
         "lidar_sweeps_npz": "/path/to/mai_city_sweeps.npz",  # holds (points_per_frame, sensor_origins, cam_to_world)
+        # LiDAR fast path (preferred; overrides lidar_sweeps_npz):
+        # the driver precomputes the spherical range images once per
+        # sweep (see sensitivity_utils.precompute_lidar_range_images)
+        # so per-voxel-size subprocesses skip the reprojection.
+        "lidar_range_images_npy": "/path/to/range_images_NxHxW.npy",
+        "lidar_poses_npy": "/path/to/cam_to_world_Nx4x4.npy",
         # Depth only:
         "depth_image_paths": [...],
         "depth_intrinsics": {"fu": ..., "fv": ..., "cu": ..., "cv": ..., "width": ..., "height": ...},
@@ -81,89 +87,132 @@ from nvblox_torch.mapper_params import MapperParams
 from nvblox_torch.projective_integrator_types import ProjectiveIntegratorType
 from nvblox_torch.sensor import Sensor
 
+from sensitivity_utils import (
+    apply_gpu_mem_cap,
+    squat_nbytes,
+    points_to_spherical_range_image as _points_to_spherical_range_image,
+    world_points_to_sensor_frame as _world_points_to_sensor_frame,
+)
 
-def _points_to_spherical_range_image(
-    points_sensor: np.ndarray,
-    num_azimuth: int,
-    num_elevation: int,
-    vertical_fov_rad: float,
-) -> np.ndarray:
-    """Reproject an [N, 3] sensor-frame point cloud to an
-    (H, W) = (num_elevation, num_azimuth) range image matching
-    nvblox's `Sensor.from_lidar` parameterisation.
 
-    Reference: nvblox's internal `Lidar::project` uses
-        azimuth = atan2(y, x)                              # (-pi, pi]
-        elevation = atan2(z, sqrt(x**2 + y**2))            # (-v_fov/2, +v_fov/2)
-        u = (azimuth + pi) / (2*pi) * num_azimuth
-        v = (elevation + v_fov/2) / v_fov * num_elevation
+def _device_used_bytes() -> int:
+    """Driver-reported used bytes on the visible device (all processes)."""
+    free_b, total_b = torch.cuda.mem_get_info()
+    return total_b - free_b
 
-    Points outside the vertical FoV or mapped to the same pixel as a
-    closer point are discarded (kept: min range per pixel).
 
-    Returns an fp32 (num_elevation, num_azimuth) array; pixels with
-    no hit are 0.0 (nvblox skips depth==0 automatically).
+def _configure_mapper_params(spec: Dict[str, Any], workload: str) -> MapperParams:
+    """Build MapperParams from the spec, honouring the sensitivity-
+    analysis knobs.
+
+    - Truncation: `truncation_distance_m` / voxel_size, set in voxels.
+      Omit `truncation_distance_m` (or set it <= 0) to leave nvblox's
+      upstream default (4.0 x voxel) untouched.
+    - Max integration distance: optional `max_integration_distance_m`.
+      The paper's workload-matched config uses 60 m for LiDAR; nvblox's
+      upstream defaults are 10 m (LiDAR) / 7 m (depth). Omit to leave
+      the upstream default untouched.
+
+    On nvblox_torch >= 0.0.10 the integrator params live on a
+    `ProjectiveIntegratorParams` sub-object reachable only through
+    `MapperParams.get_/set_projective_integrator_params` (verified on
+    the 0.0.10 build: the flat attribute spellings all hasattr-False).
+    Older builds exposed flat attributes on MapperParams directly; we
+    support both, and a candidate is only applied if the target object
+    already exposes it (`hasattr`), so a plain-Python params class
+    can't silently absorb a misspelled name.
+
+    Returns (params, effective) where `effective` is a disclosure dict
+    of the parameter values this run will use (explicitly set AND
+    readable defaults) for the result JSON. A run that configures
+    nothing still discloses the build's defaults.
     """
-    if points_sensor.shape[0] == 0:
-        return np.zeros((num_elevation, num_azimuth), dtype=np.float32)
+    params = MapperParams()
+    effective: Dict[str, float] = {}
 
-    x = points_sensor[:, 0]
-    y = points_sensor[:, 1]
-    z = points_sensor[:, 2]
-    radial_xy = np.sqrt(x * x + y * y)
-    ranges = np.sqrt(radial_xy * radial_xy + z * z)
+    voxel_size_m = float(spec["voxel_size_m"])
+    trunc_m = float(spec.get("truncation_distance_m", -1.0))
+    max_dist_m = spec.get("max_integration_distance_m", None)
 
-    # Filter zero-range and out-of-FoV points. Keep epsilon for
-    # numerical stability at the pole (radial_xy == 0 would NaN
-    # atan2(z, 0) to +/-pi/2 which is fine but let's be defensive).
-    valid = (ranges > 1e-4) & (radial_xy > 1e-6)
-    x, y, z, radial_xy, ranges = x[valid], y[valid], z[valid], radial_xy[valid], ranges[valid]
+    # Locate the object that carries the integrator params: the
+    # ProjectiveIntegratorParams sub-object on new builds, MapperParams
+    # itself on old ones.
+    sub_params = None
+    try:
+        sub_params = params.get_projective_integrator_params()
+    except AttributeError:
+        pass
+    target = sub_params if sub_params is not None else params
 
-    azimuth = np.arctan2(y, x)                   # (-pi, pi]
-    elevation = np.arctan2(z, radial_xy)         # roughly (-v_fov/2, +v_fov/2) for LiDAR
+    trunc_attrs = {
+        "lidar": ("projective_integrator_truncation_distance_vox",
+                  "tsdf_integrator_truncation_distance_vox"),
+        "depth": ("projective_integrator_truncation_distance_vox",
+                  "tsdf_integrator_truncation_distance_vox"),
+        "lidar_occupancy": ("occupancy_integrator_truncation_distance_vox",
+                            "projective_integrator_truncation_distance_vox"),
+    }[workload]
+    if trunc_m > 0:
+        for attr in trunc_attrs:
+            if hasattr(target, attr):
+                setattr(target, attr, float(trunc_m / voxel_size_m))
+                break
 
-    # Clamp into the valid range the sensor accepts.
-    el_min = -vertical_fov_rad / 2.0
-    el_max = +vertical_fov_rad / 2.0
-    in_fov = (elevation >= el_min) & (elevation < el_max)
-    azimuth, elevation, ranges = azimuth[in_fov], elevation[in_fov], ranges[in_fov]
+    if max_dist_m is not None and float(max_dist_m) > 0:
+        dist_attrs = (
+            "lidar_projective_integrator_max_integration_distance_m",
+            "projective_integrator_max_integration_distance_m",
+        ) if workload in ("lidar", "lidar_occupancy") else (
+            "projective_integrator_max_integration_distance_m",
+        )
+        for attr in dist_attrs:
+            if hasattr(target, attr):
+                setattr(target, attr, float(max_dist_m))
+                break
 
-    # Map to pixel indices.
-    u = ((azimuth + math.pi) / (2.0 * math.pi) * num_azimuth).astype(np.int64)
-    v = ((elevation - el_min) / vertical_fov_rad * num_elevation).astype(np.int64)
-    # Clip to valid range (guards against +pi azimuth rounding to num_azimuth).
-    u = np.clip(u, 0, num_azimuth - 1)
-    v = np.clip(v, 0, num_elevation - 1)
+    if sub_params is not None:
+        params.set_projective_integrator_params(sub_params)
 
-    # Keep min range per pixel. Vectorised via numpy: combine (v, u)
-    # into a single flat index, then sort by range ascending and use
-    # np.unique on the flat index with `return_index=True` to pick
-    # the first (smallest-range) entry per pixel.
-    flat_idx = v * num_azimuth + u
-    order = np.argsort(ranges)              # ascending
-    flat_sorted = flat_idx[order]
-    range_sorted = ranges[order]
-    _, first_idx = np.unique(flat_sorted, return_index=True)
-    pick_flat = flat_sorted[first_idx]
-    pick_range = range_sorted[first_idx]
-
-    depth = np.zeros(num_elevation * num_azimuth, dtype=np.float32)
-    depth[pick_flat] = pick_range.astype(np.float32)
-    return depth.reshape(num_elevation, num_azimuth)
+    # Echo the params this nvblox build will actually use (defaults
+    # included, where readable) so every result JSON is self-disclosing.
+    for attr in ("projective_integrator_truncation_distance_vox",
+                 "tsdf_integrator_truncation_distance_vox",
+                 "occupancy_integrator_truncation_distance_vox",
+                 "lidar_projective_integrator_max_integration_distance_m",
+                 "projective_integrator_max_integration_distance_m"):
+        if hasattr(target, attr):
+            try:
+                effective[attr] = float(getattr(target, attr))
+            except Exception:
+                pass
+    return params, effective
 
 
-def _world_points_to_sensor_frame(
-    points_world: np.ndarray,
-    sensor_to_world: np.ndarray,
-) -> np.ndarray:
-    """Invert the sensor pose to bring world-frame points back into
-    the sensor-local frame nvblox expects.
-    `sensor_to_world` is the 4x4 camera-to-world transform.
+# NOTE: `_points_to_spherical_range_image` and
+# `_world_points_to_sensor_frame` moved to `sensitivity_utils` (see
+# the aliased imports at the top) so the bench drivers can precompute
+# range images once per sweep and share them across subprocesses.
+
+
+def _load_lidar_frames(spec: Dict[str, Any]):
+    """Load the sweep data for a LiDAR workload spec.
+
+    Returns (range_images, pts_concat, pts_offsets, cam_to_world,
+    n_frames). Exactly one of `range_images` (fast path: the driver
+    precomputed the spherical range images once per sweep; mmapped so
+    frames page in on demand) or `pts_concat`+`pts_offsets` (legacy
+    path: raw world-frame points, reprojected per frame here) is
+    non-None.
     """
-    # p_s = R_ws^T (p_w - t_ws)
-    R = sensor_to_world[:3, :3]
-    t = sensor_to_world[:3, 3]
-    return (points_world - t[None, :]) @ R
+    if spec.get("lidar_range_images_npy"):
+        range_images = np.load(spec["lidar_range_images_npy"], mmap_mode="r")
+        cam_to_world_np = np.load(spec["lidar_poses_npy"])    # [n_frames, 4, 4]
+        return range_images, None, None, cam_to_world_np, int(range_images.shape[0])
+    data = np.load(spec["lidar_sweeps_npz"])
+    pts_concat = data["points_per_frame_concat"]          # [N_total, 3]
+    pts_offsets = data["points_per_frame_offsets"]        # [n_frames + 1]
+    cam_to_world_np = data["cam_to_world"]                # [n_frames, 4, 4]
+    return None, pts_concat, pts_offsets, cam_to_world_np, len(pts_offsets) - 1
 
 
 def run_lidar(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -185,26 +234,16 @@ def run_lidar(spec: Dict[str, Any]) -> Dict[str, Any]:
     min_valid_range_m = float(spec.get("lidar_min_valid_range_m", 1.0))
     warmup_frames = int(spec.get("warmup_frames", 2))
 
-    data = np.load(spec["lidar_sweeps_npz"])
-    pts_concat = data["points_per_frame_concat"]          # [N_total, 3]
-    pts_offsets = data["points_per_frame_offsets"]        # [n_frames + 1]
-    sensor_origins = data["sensor_origins"]               # [n_frames, 3]
-    cam_to_world_np = data["cam_to_world"]                # [n_frames, 4, 4]
-    n_frames = len(pts_offsets) - 1
+    (range_images, pts_concat, pts_offsets,
+     cam_to_world_np, n_frames) = _load_lidar_frames(spec)
 
     # Build the nvblox mapper up-front.
-    params = MapperParams()
-    # Set truncation distance if the API exposes it. nvblox's default is
-    # 4 * voxel_size which may or may not match our desired 3x multiplier;
-    # configure explicitly so the comparison is fair.
-    try:
-        # The param name is `truncation_distance_vox` (in voxels) in
-        # recent nvblox. Compute ratio.
-        vox_ratio = trunc_m / voxel_size_m
-        params.tsdf_integrator_truncation_distance_vox = float(vox_ratio)
-    except AttributeError:
-        # Older API -- skip and accept default.
-        pass
+    apply_gpu_mem_cap(spec.get("gpu_mem_cap_gb"))
+    # Baseline AFTER any in-process squat: the reported gpu_used_gb is
+    # the delta this workload adds, excluding emulation squatters (in
+    # this process or the driver's) and pre-existing contexts.
+    base_used_b = _device_used_bytes()
+    params, effective_params = _configure_mapper_params(spec,"lidar")
 
     mapper = Mapper(
         voxel_sizes_m=[voxel_size_m],
@@ -221,12 +260,16 @@ def run_lidar(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     # Warmup on the first two frames to pre-allocate nvblox's block pool.
     def one_frame(i: int) -> None:
-        start, end = int(pts_offsets[i]), int(pts_offsets[i + 1])
-        pts_w = pts_concat[start:end]
         pose = cam_to_world_np[i]
-        pts_s = _world_points_to_sensor_frame(pts_w, pose)
-        depth_img = _points_to_spherical_range_image(
-            pts_s, num_azimuth, num_elevation, vertical_fov_rad)
+        if range_images is not None:
+            # ascontiguousarray also copies out of the read-only mmap
+            # so torch.from_numpy gets a writable buffer.
+            depth_img = np.ascontiguousarray(range_images[i], dtype=np.float32)
+        else:
+            start, end = int(pts_offsets[i]), int(pts_offsets[i + 1])
+            pts_s = _world_points_to_sensor_frame(pts_concat[start:end], pose)
+            depth_img = _points_to_spherical_range_image(
+                pts_s, num_azimuth, num_elevation, vertical_fov_rad)
         depth_t = torch.from_numpy(depth_img).cuda()
         pose_t = torch.from_numpy(pose).float()
         mapper.add_depth_frame(
@@ -288,8 +331,7 @@ def run_lidar(spec: Dict[str, Any]) -> Dict[str, Any]:
     # aggregate used memory.
     gpu_used_gb = -1.0
     try:
-        free_b, total_b = torch.cuda.mem_get_info()
-        gpu_used_gb = (total_b - free_b) / 1e9
+        gpu_used_gb = (_device_used_bytes() - base_used_b) / 1e9
     except Exception:
         pass
     peak_torch_gb = -1.0
@@ -374,6 +416,8 @@ def run_lidar(spec: Dict[str, Any]) -> Dict[str, Any]:
         "n_mesh_verts": n_mesh_verts,
         "n_mesh_tris": n_mesh_tris,
         "voxel_size_m": voxel_size_m,
+        "nvblox_params": effective_params,
+        "gpu_mem_cap_gb": spec.get("gpu_mem_cap_gb"),
         "esdf_cold_ms": esdf_cold_ms,
         "esdf_warm_ms_min": esdf_warm_ms_min,
         "esdf_warm_ms_median": esdf_warm_ms_median,
@@ -403,26 +447,15 @@ def run_lidar_occupancy(spec: Dict[str, Any]) -> Dict[str, Any]:
     min_valid_range_m = float(spec.get("lidar_min_valid_range_m", 1.0))
     warmup_frames = int(spec.get("warmup_frames", 2))
 
-    data = np.load(spec["lidar_sweeps_npz"])
-    pts_concat = data["points_per_frame_concat"]
-    pts_offsets = data["points_per_frame_offsets"]
-    cam_to_world_np = data["cam_to_world"]
-    n_frames = len(pts_offsets) - 1
+    (range_images, pts_concat, pts_offsets,
+     cam_to_world_np, n_frames) = _load_lidar_frames(spec)
 
-    params = MapperParams()
-    # nvblox's occupancy integrator has its own truncation param
-    # (distinct from the TSDF one). Try the common spellings;
-    # fall back to default if neither exists on this build.
-    for attr in (
-        "occupancy_integrator_truncation_distance_vox",
-        "occupancy_integrator_max_integration_distance_m",
-    ):
-        try:
-            if "vox" in attr:
-                setattr(params, attr, float(trunc_m / voxel_size_m))
-            # max_integration_distance is different semantic; skip
-        except AttributeError:
-            pass
+    apply_gpu_mem_cap(spec.get("gpu_mem_cap_gb"))
+    # Baseline AFTER any in-process squat: the reported gpu_used_gb is
+    # the delta this workload adds, excluding emulation squatters (in
+    # this process or the driver's) and pre-existing contexts.
+    base_used_b = _device_used_bytes()
+    params, effective_params = _configure_mapper_params(spec,"lidar_occupancy")
 
     mapper = Mapper(
         voxel_sizes_m=[voxel_size_m],
@@ -438,12 +471,14 @@ def run_lidar_occupancy(spec: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     def one_frame(i: int) -> None:
-        start, end = int(pts_offsets[i]), int(pts_offsets[i + 1])
-        pts_w = pts_concat[start:end]
         pose = cam_to_world_np[i]
-        pts_s = _world_points_to_sensor_frame(pts_w, pose)
-        depth_img = _points_to_spherical_range_image(
-            pts_s, num_azimuth, num_elevation, vertical_fov_rad)
+        if range_images is not None:
+            depth_img = np.ascontiguousarray(range_images[i], dtype=np.float32)
+        else:
+            start, end = int(pts_offsets[i]), int(pts_offsets[i + 1])
+            pts_s = _world_points_to_sensor_frame(pts_concat[start:end], pose)
+            depth_img = _points_to_spherical_range_image(
+                pts_s, num_azimuth, num_elevation, vertical_fov_rad)
         depth_t = torch.from_numpy(depth_img).cuda()
         pose_t = torch.from_numpy(pose).float()
         mapper.add_depth_frame(
@@ -495,8 +530,7 @@ def run_lidar_occupancy(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     gpu_used_gb = -1.0
     try:
-        free_b, total_b = torch.cuda.mem_get_info()
-        gpu_used_gb = (total_b - free_b) / 1e9
+        gpu_used_gb = (_device_used_bytes() - base_used_b) / 1e9
     except Exception:
         pass
     peak_torch_gb = -1.0
@@ -517,6 +551,8 @@ def run_lidar_occupancy(spec: Dict[str, Any]) -> Dict[str, Any]:
         "n_voxels": n_voxels_upper,
         "n_blocks": n_blocks if n_blocks is not None else -1,
         "voxel_size_m": voxel_size_m,
+        "nvblox_params": effective_params,
+        "gpu_mem_cap_gb": spec.get("gpu_mem_cap_gb"),
     }
 
 
@@ -549,12 +585,12 @@ def run_depth(spec: Dict[str, Any]) -> Dict[str, Any]:
     K_np         = data["K"]              # [3, 3] fp32
     n_frames, height, width = depth_images.shape
 
-    params = MapperParams()
-    try:
-        vox_ratio = trunc_m / voxel_size_m
-        params.tsdf_integrator_truncation_distance_vox = float(vox_ratio)
-    except AttributeError:
-        pass
+    apply_gpu_mem_cap(spec.get("gpu_mem_cap_gb"))
+    # Baseline AFTER any in-process squat: the reported gpu_used_gb is
+    # the delta this workload adds, excluding emulation squatters (in
+    # this process or the driver's) and pre-existing contexts.
+    base_used_b = _device_used_bytes()
+    params, effective_params = _configure_mapper_params(spec,"depth")
 
     mapper = Mapper(
         voxel_sizes_m=[voxel_size_m],
@@ -610,8 +646,7 @@ def run_depth(spec: Dict[str, Any]) -> Dict[str, Any]:
 
     gpu_used_gb = -1.0
     try:
-        free_b, total_b = torch.cuda.mem_get_info()
-        gpu_used_gb = (total_b - free_b) / 1e9
+        gpu_used_gb = (_device_used_bytes() - base_used_b) / 1e9
     except Exception:
         pass
     peak_torch_gb = -1.0
@@ -672,6 +707,8 @@ def run_depth(spec: Dict[str, Any]) -> Dict[str, Any]:
         "n_mesh_verts": n_mesh_verts,
         "n_mesh_tris": n_mesh_tris,
         "voxel_size_m": voxel_size_m,
+        "nvblox_params": effective_params,
+        "gpu_mem_cap_gb": spec.get("gpu_mem_cap_gb"),
         "esdf_cold_ms": esdf_cold_ms,
         "esdf_warm_ms_min": esdf_warm_ms_min,
         "esdf_warm_ms_median": esdf_warm_ms_median,

@@ -46,6 +46,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kitti_loader import load_kitti_scene  # noqa: E402
 from bench_mai_city import run_nvblox, run_vdbfusion  # noqa: E402
+from sensitivity_utils import (  # noqa: E402
+    apply_gpu_mem_cap,
+    clip_scene_to_max_range,
+    squat_nbytes,
+)
 
 
 def run_fvdb_chunked(scene, voxel_size: float, truncation: float,
@@ -141,7 +146,7 @@ def run_fvdb_chunked(scene, voxel_size: float, truncation: float,
                 "failure": f"runtime: {msg.splitlines()[0][:140]}"}
 
     ms_per_f = (time.perf_counter() - t0) * 1000 / N
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_gb = (torch.cuda.max_memory_allocated() - squat_nbytes()) / 1e9
     return {
         "system": "fvdb", "ok": True,
         "ms_per_f": ms_per_f, "peak_gb": peak_gb,
@@ -189,7 +194,27 @@ def main() -> None:
                         "* avg_pts * 12 B. Default 200 -> ~290 MB transient "
                         "for KITTI (vs ~6.6 GB if all 4541 frames pre-loaded).")
     p.add_argument("--json-out", type=str, default=None)
+    # --- Sensitivity-analysis knobs (see bench_mai_city.py) ---
+    p.add_argument("--nvblox-python", type=str, default=None)
+    p.add_argument("--nvblox-max-integration-distance-m", type=float,
+                   default=None,
+                   help="60 = paper's workload-matched config; omit for "
+                        "nvblox's upstream default (10 m)")
+    p.add_argument("--max-range-m", type=float, default=None,
+                   help="radial clip on input points for in-process systems")
+    p.add_argument("--gpu-mem-cap-gb", type=float, default=None,
+                   help="emulate a smaller GPU (51.5 = paper's 48 GB Ada)")
     args = p.parse_args()
+
+    if (args.skip_known_oom
+            and args.nvblox_max_integration_distance_m is None):
+        # The known-OOM table below was measured at the paper's 60 m
+        # workload-matched config; at nvblox's upstream defaults the
+        # OOM threshold is exactly what we're trying to measure.
+        print("[note] --skip-known-oom disabled: nvblox is running at its "
+              "upstream defaults, where the Mai City OOM evidence does "
+              "not apply.", flush=True)
+        args.skip_known_oom = False
 
     max_frames = None if args.n_frames <= 0 else args.n_frames
 
@@ -199,6 +224,9 @@ def main() -> None:
     for seq in args.sequences:
         print(f"\n##### KITTI seq={seq!r} #####", flush=True)
         scene = load_kitti_scene(args.root, sequence=seq, max_frames=max_frames)
+        if args.max_range_m is not None:
+            scene = clip_scene_to_max_range(scene, args.max_range_m)
+        apply_gpu_mem_cap(args.gpu_mem_cap_gb)
         traj_len = float(np.linalg.norm(
             np.diff(scene.sensor_origins, axis=0), axis=1).sum())
         print(f"Loaded: {scene.n_frames} frames, "
@@ -226,7 +254,12 @@ def main() -> None:
                 elif system == "vdbfusion":
                     r = run_vdbfusion(scene, vs, trunc)
                 elif system == "nvblox":
-                    r = run_nvblox(scene, vs, trunc)
+                    r = run_nvblox(
+                        scene, vs, trunc,
+                        nvblox_env_python=args.nvblox_python,
+                        max_integration_distance_m=(
+                            args.nvblox_max_integration_distance_m),
+                        gpu_mem_cap_gb=args.gpu_mem_cap_gb)
                 else:
                     continue
                 r["voxel_size"] = vs
