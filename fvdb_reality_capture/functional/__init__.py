@@ -32,7 +32,12 @@ from ._rasterization import (
     rasterize_world_space_gaussians,
 )
 from ._spherical_harmonics import evaluate_gaussian_sh, sh_degree_from_coefficients
-from ._tile_intersection import deduplicate_pixels, intersect_gaussian_tiles, intersect_gaussian_tiles_sparse
+from ._tile_intersection import (
+    as_pixel_jagged,
+    deduplicate_pixels,
+    intersect_gaussian_tiles,
+    intersect_gaussian_tiles_sparse,
+)
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 __all__ = [
@@ -50,6 +55,7 @@ __all__ = [
     "intersect_gaussian_tiles",
     "intersect_gaussian_tiles_sparse",
     "deduplicate_pixels",
+    "as_pixel_jagged",
     # Stage 4: rasterization
     "rasterize_screen_space_gaussians",
     "rasterize_world_space_gaussians",

@@ -13,7 +13,7 @@ from fvdb import JaggedTensor
 from ..enums import CameraModel, ProjectionMethod
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ProjectedGaussians:
     """
     Output of :func:`project_gaussians`: the 2D footprint of every Gaussian in every camera.
@@ -71,7 +71,7 @@ class ProjectedGaussians:
         return self.projection_method == ProjectionMethod.ANALYTIC
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class GaussianTileIntersection:
     """Output of :func:`intersect_gaussian_tiles`: which Gaussians touch which image tile, depth sorted."""
 
@@ -101,7 +101,7 @@ class GaussianTileIntersection:
         return self.tile_offsets.shape[1]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SparseGaussianTileIntersection:
     """
     Output of :func:`intersect_gaussian_tiles_sparse`: tile bookkeeping for rendering an arbitrary

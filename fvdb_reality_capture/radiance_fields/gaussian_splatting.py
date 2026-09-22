@@ -17,6 +17,7 @@ from fvdb.types import DeviceIdentifier, cast_check, resolve_device
 from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
     ProjectedGaussians,
+    as_pixel_jagged,
     compute_gaussian_opacities,
     deduplicate_pixels,
     evaluate_gaussian_sh,
@@ -30,7 +31,6 @@ from ..functional import (
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
     rasterize_world_space_gaussians,
-    resolve_projection_method,
 )
 from ..functional._autograd import (
     _EvaluateGaussianSHFn,
@@ -87,6 +87,7 @@ class ProjectedGaussianSplats:
         self._far_plane = far_plane
         self._min_radius_2d = min_radius_2d
         self._sh_degree_to_use = sh_degree_to_use
+        self._opacities: torch.Tensor | None = None
 
     @property
     def projected_gaussians(self) -> ProjectedGaussians:
@@ -229,7 +230,9 @@ class ProjectedGaussianSplats:
             opacities (torch.Tensor): A tensor of shape ``(C, N)`` representing the opacity of each projected Gaussian, where
                 ``C`` is the number of image planes, and ``N`` is the number of projected Gaussians.
         """
-        return compute_gaussian_opacities(self._logit_opacities, self._projected)
+        if self._opacities is None:
+            self._opacities = compute_gaussian_opacities(self._logit_opacities, self._projected)
+        return self._opacities
 
     @property
     def camera_model(self) -> CameraModel:
@@ -1419,28 +1422,11 @@ class GaussianSplat3d:
     # ---------------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
-        return resolve_projection_method(camera_model, projection_method)
-
-    @staticmethod
     def _deduplicate_pixels(
         pixels_jt: JaggedTensor, image_width: int, image_height: int
     ) -> tuple[JaggedTensor, torch.Tensor, bool]:
         """Per-camera pixel deduplication; see :func:`fvdb_reality_capture.functional.deduplicate_pixels`."""
         return deduplicate_pixels(pixels_jt, image_width, image_height)
-
-    @staticmethod
-    def _as_pixel_jagged(pixels_to_render: JaggedTensor | torch.Tensor) -> JaggedTensor:
-        """Accept pixel selections as a JaggedTensor or a ``[C, P, 2]`` tensor with one row per camera."""
-        if isinstance(pixels_to_render, JaggedTensor):
-            return pixels_to_render
-        if isinstance(pixels_to_render, torch.Tensor):
-            if pixels_to_render.dim() != 3 or pixels_to_render.shape[-1] != 2:
-                raise ValueError(
-                    f"pixels_to_render tensor must have shape [C, P, 2], got {tuple(pixels_to_render.shape)}"
-                )
-            return JaggedTensor(list(pixels_to_render.unbind(0)))
-        raise TypeError("pixels_to_render must be either a torch.Tensor or a fvdb.JaggedTensor")
 
     def _projection_accumulators(self) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Create the enabled densification accumulators if missing or stale and return them."""
@@ -1659,7 +1645,7 @@ class GaussianSplat3d:
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         sparse_tiles = intersect_gaussian_tiles_sparse(pixels_to_render, projected, self._logit_opacities, tile_size)
         return rasterize_screen_space_gaussians_sparse(
-            projected, features, self._logit_opacities, sparse_tiles, backgrounds=backgrounds, masks=masks
+            projected, features, self._logit_opacities, sparse_tiles, backgrounds=backgrounds, tile_masks=masks
         )
 
     @staticmethod
@@ -2097,13 +2083,18 @@ class GaussianSplat3d:
         crop_h = crop_height if crop_height > 0 else height
         origin_w = crop_origin_w if crop_origin_w >= 0 else 0
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
+        # Crops are clipped to the image, so the output can be smaller than requested at the edges.
+        crop_w = min(crop_w, width - origin_w)
+        crop_h = min(crop_h, height - origin_h)
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
         crop = (origin_w, origin_h, crop_w, crop_h) if is_crop else None
         full_masks = masks
         if masks is not None and is_crop:
-            # The mask is given in crop coordinates; embed it in the full image for the rasterizer.
+            # The mask is given in crop coordinates; embed its clipped region in the full image.
             full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
-            full_masks[:, origin_h : origin_h + masks.shape[1], origin_w : origin_w + masks.shape[2]] = masks
+            full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
+                :, :crop_h, :crop_w
+            ].bool()
         tiles = intersect_gaussian_tiles(projected, pg.logit_opacities, tile_size)
         return rasterize_screen_space_gaussians(
             projected,
@@ -2302,7 +2293,7 @@ class GaussianSplat3d:
                 and ``P`` is the number of pixel coordinates rendered per camera. Each element represents the alpha value (opacity) at that pixel such that ``0 <= alpha < 1``,
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
-        pixels_jt = self._as_pixel_jagged(pixels_to_render)
+        pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
             pixels_jt,
             world_to_camera_matrices,
@@ -2678,7 +2669,7 @@ class GaussianSplat3d:
                 Each element represents the alpha value (opacity) at that pixel such that ``0 <= alpha < 1``,
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
-        pixels_jt = self._as_pixel_jagged(pixels_to_render)
+        pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
             pixels_jt,
             world_to_camera_matrices,
@@ -2791,7 +2782,7 @@ class GaussianSplat3d:
                 Each element represents the alpha value (opacity) at that pixel such that ``0 <= alpha < 1``,
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
-        pixels_jt = self._as_pixel_jagged(pixels_to_render)
+        pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
             pixels_jt,
             world_to_camera_matrices,
@@ -3164,7 +3155,7 @@ class GaussianSplat3d:
                 Each element represents the alpha value (opacity) at that pixel such that ``0 <= alpha < 1``,
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
-        pixels_jt = self._as_pixel_jagged(pixels_to_render)
+        pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
             projected = self._project(
                 world_to_camera_matrices,
@@ -3364,7 +3355,7 @@ class GaussianSplat3d:
             weights (fvdb.JaggedTensor): A ``[[C1P1 + C1P2 + ... C1PN1, 1], ... [CNP1 + CNP2 + ... CNPNN, 1]]`` jagged tensor
                 containing the weights of the contributing Gaussians of each rendered pixel for each camera. The weights are in row-major order and sum to 1 for each pixel if that pixel is opaque (alpha=1).
         """
-        pixels_jt = self._as_pixel_jagged(pixels_to_render)
+        pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
             projected = self._project(
                 world_to_camera_matrices,

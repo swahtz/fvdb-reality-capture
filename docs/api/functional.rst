@@ -87,6 +87,8 @@ Stage 3: Tile Intersection
 
 .. autofunction:: deduplicate_pixels
 
+.. autofunction:: as_pixel_jagged
+
 
 Stage 4: Rasterization
 ----------------------

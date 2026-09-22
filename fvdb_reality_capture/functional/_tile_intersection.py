@@ -25,7 +25,8 @@ def _culling_inputs(
     """Conics and opacities for the tighter iso-contour tile test, or ``None`` for the bounding-box test."""
     if logit_opacities is None:
         return None, None
-    return projected.conics, compute_gaussian_opacities(logit_opacities, projected).detach()
+    with torch.no_grad():
+        return projected.conics, compute_gaussian_opacities(logit_opacities, projected)
 
 
 def intersect_gaussian_tiles(
@@ -69,7 +70,16 @@ def intersect_gaussian_tiles(
     )
 
 
-def _as_pixel_jagged(pixels_to_render: JaggedTensor | torch.Tensor) -> JaggedTensor:
+def as_pixel_jagged(pixels_to_render: JaggedTensor | torch.Tensor) -> JaggedTensor:
+    """Normalize a pixel selection to a JaggedTensor with one ``[P_c, 2]`` list of ``(row, col)`` per camera.
+
+    Args:
+        pixels_to_render (JaggedTensor | torch.Tensor): A JaggedTensor, returned as is, or a ``[C, P, 2]``
+            tensor with the same number of pixels for every camera.
+
+    Returns:
+        pixels (JaggedTensor): The selection as a JaggedTensor.
+    """
     if isinstance(pixels_to_render, JaggedTensor):
         return pixels_to_render
     if isinstance(pixels_to_render, torch.Tensor):
@@ -157,7 +167,7 @@ def intersect_gaussian_tiles_sparse(
     Returns:
         sparse_tiles (SparseGaussianTileIntersection): The sparse tile intersections.
     """
-    pixels = _as_pixel_jagged(pixels_to_render)
+    pixels = as_pixel_jagged(pixels_to_render)
     num_tiles_h, num_tiles_w = _tile_grid(projected.image_width, projected.image_height, tile_size)
     unique_pixels, inverse_indices, has_duplicates = deduplicate_pixels(
         pixels, projected.image_width, projected.image_height

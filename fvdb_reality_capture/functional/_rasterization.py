@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as nnf
 from fvdb import JaggedTensor
 
-from ..enums import RollingShutterType
+from ..enums import CameraModel, RollingShutterType
 from ._autograd import (
     _RasterizeScreenSpaceGaussiansFn,
     _RasterizeScreenSpaceGaussiansSparseFn,
@@ -41,16 +41,38 @@ def _validate_crop(crop: Crop, image_width: int, image_height: int) -> Crop:
     return origin_w, origin_h, width, height
 
 
-def _crop_window_mask(
-    crop: Crop | None, masks: torch.Tensor | None, num_cameras: int, image_width: int, image_height: int, device
-) -> tuple[Crop | None, torch.Tensor | None]:
-    """Fold a crop into the per-pixel mask so tiles outside the crop are skipped by the rasterizer."""
+def _render_masks(
+    crop: Crop | None,
+    masks: torch.Tensor | None,
+    num_cameras: int,
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    device: torch.device,
+) -> tuple[Crop | None, torch.Tensor | None, torch.Tensor | None]:
+    """Resolve the crop and masks into what the rasterizer and the post-pass need.
+
+    Returns the clamped crop, the per-pixel mask to apply after rendering (``None`` when no pixel
+    mask was given, since slicing to the crop already discards out-of-crop pixels), and the per-tile
+    mask that lets the rasterizer skip tiles outside the crop or fully masked out.
+    """
+    if masks is not None:
+        masks = masks.bool()
     if crop is None:
-        return None, masks
+        tile_masks = pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else None
+        return None, masks, tile_masks
     origin_w, origin_h, width, height = _validate_crop(crop, image_width, image_height)
-    window = torch.zeros(num_cameras, image_height, image_width, dtype=torch.bool, device=device)
-    window[:, origin_h : origin_h + height, origin_w : origin_w + width] = True
-    return (origin_w, origin_h, width, height), window if masks is None else masks & window
+    num_tiles_h = -(-image_height // tile_size)
+    num_tiles_w = -(-image_width // tile_size)
+    tile_window = torch.zeros(num_cameras, num_tiles_h, num_tiles_w, dtype=torch.bool, device=device)
+    tile_window[
+        :,
+        origin_h // tile_size : -(-(origin_h + height) // tile_size),
+        origin_w // tile_size : -(-(origin_w + width) // tile_size),
+    ] = True
+    if masks is None:
+        return (origin_w, origin_h, width, height), None, tile_window
+    return (origin_w, origin_h, width, height), masks, pixel_mask_to_tile_mask(masks, tile_size) & tile_window
 
 
 def _apply_crop(images: torch.Tensor, alphas: torch.Tensor, crop: Crop | None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -73,7 +95,9 @@ def pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.T
     Returns:
         tile_mask (torch.Tensor): Boolean per-tile mask, ``[C, ceil(H / tile_size), ceil(W / tile_size)]``.
     """
-    pooled = nnf.max_pool2d(pixel_mask.unsqueeze(1).float(), kernel_size=tile_size, stride=tile_size, ceil_mode=True)
+    pooled = nnf.max_pool2d(
+        pixel_mask.bool().unsqueeze(1).float(), kernel_size=tile_size, stride=tile_size, ceil_mode=True
+    )
     return pooled.bool().squeeze(1)
 
 
@@ -102,7 +126,8 @@ def rasterize_screen_space_gaussians(
 
     Differentiable with respect to the projection, ``features`` and ``logit_opacities``. A ``crop``
     selects a window of the images: tiles outside it are skipped and the result is exactly the
-    corresponding region of the uncropped render.
+    corresponding region of the uncropped render. The output buffers are still allocated at full
+    image size before slicing.
 
     Args:
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
@@ -120,10 +145,9 @@ def rasterize_screen_space_gaussians(
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
     opacities = compute_gaussian_opacities(logit_opacities, projected)
-    crop, masks = _crop_window_mask(
-        crop, masks, projected.num_cameras, tiles.image_width, tiles.image_height, opacities.device
+    crop, masks, tile_masks = _render_masks(
+        crop, masks, projected.num_cameras, tiles.image_width, tiles.image_height, tiles.tile_size, opacities.device
     )
-    tile_masks = pixel_mask_to_tile_mask(masks, tiles.tile_size) if masks is not None else None
     images, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeScreenSpaceGaussiansFn.apply(
@@ -180,7 +204,7 @@ def rasterize_world_space_gaussians(
         projection_matrices (torch.Tensor): Camera intrinsics, ``[C, 3, 3]``.
         tiles (GaussianTileIntersection): Output of :func:`intersect_gaussian_tiles` for ``projected``.
         distortion_coeffs (torch.Tensor | None): Packed OpenCV distortion coefficients, ``[C, 12]``.
-            Zeros are used if ``None``.
+            Required for the OpenCV camera models; ``None`` is allowed for pinhole and orthographic cameras.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
         masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep.
@@ -191,13 +215,14 @@ def rasterize_world_space_gaussians(
     """
     opacities = compute_gaussian_opacities(logit_opacities, projected)
     if distortion_coeffs is None:
+        if projected.camera_model not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
+            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
         distortion_coeffs = torch.zeros(
             projected.num_cameras, 12, device=world_to_camera_matrices.device, dtype=world_to_camera_matrices.dtype
         )
-    crop, masks = _crop_window_mask(
-        crop, masks, projected.num_cameras, tiles.image_width, tiles.image_height, opacities.device
+    crop, masks, tile_masks = _render_masks(
+        crop, masks, projected.num_cameras, tiles.image_width, tiles.image_height, tiles.tile_size, opacities.device
     )
-    tile_masks = pixel_mask_to_tile_mask(masks, tiles.tile_size) if masks is not None else None
     images, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeWorldSpaceGaussiansFn.apply(
@@ -234,7 +259,7 @@ def rasterize_screen_space_gaussians_sparse(
     logit_opacities: torch.Tensor,
     sparse_tiles: SparseGaussianTileIntersection,
     backgrounds: torch.Tensor | None = None,
-    masks: torch.Tensor | None = None,
+    tile_masks: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """Alpha-blend projected Gaussians at the requested pixels only.
 
@@ -247,7 +272,9 @@ def rasterize_screen_space_gaussians_sparse(
         logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
         sparse_tiles (SparseGaussianTileIntersection): Output of :func:`intersect_gaussian_tiles_sparse`.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
-        masks (torch.Tensor | None): Boolean per-tile render mask, ``[C, num_tiles_h, num_tiles_w]``.
+        tile_masks (torch.Tensor | None): Boolean per-tile render mask, ``[C, num_tiles_h, num_tiles_w]``.
+            Unlike the dense rasterizers this is per tile, since the pixels to render are explicit;
+            use :func:`pixel_mask_to_tile_mask` to derive it from a per-pixel mask.
 
     Returns:
         features (JaggedTensor): Blended features per requested pixel, one ``[P_c, D]`` list per camera.
@@ -275,7 +302,7 @@ def rasterize_screen_space_gaussians_sparse(
             sparse_tiles.pixel_map,
             False,
             backgrounds,
-            masks,
+            None if tile_masks is None else tile_masks.bool(),
         ),
     )
     requested = sparse_tiles.pixels_to_render

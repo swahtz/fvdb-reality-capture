@@ -15,7 +15,7 @@ from fvdb import JaggedTensor
 from fvdb.utils.tests import get_fvdb_test_data_path
 
 import fvdb_reality_capture.functional as F
-from fvdb_reality_capture import GaussianRenderMode, GaussianSplat3d, ProjectionMethod
+from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3d, ProjectionMethod
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
@@ -88,6 +88,10 @@ class TestStageOutputs(FunctionalPipelineTestCase):
         self.assertTrue(projected.is_differentiable)
         with self.assertRaises(Exception):
             projected.radii = None  # frozen
+        # Equality is identity, so the dataclasses can be compared and hashed despite holding tensors.
+        self.assertEqual(projected, projected)
+        self.assertNotEqual(projected, without := F.project_gaussians(*params[:3], self.w2c, self.K, self.W, self.H))
+        self.assertEqual(len({projected, without}), 2)
 
         without = F.project_gaussians(*params[:3], self.w2c, self.K, self.W, self.H, antialias=False)
         self.assertIsNone(without.compensations)
@@ -142,7 +146,8 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         for p_fn, p_oo in zip(params_fn, params_oo):
             self.assertIsNotNone(p_fn.grad)
             self.assertGreater(float(p_fn.grad.abs().max()), 0.0)
-            torch.testing.assert_close(p_fn.grad, p_oo.grad, atol=1e-6, rtol=1e-5)
+            # Both paths run the same atomicAdd kernels, so agreement is up to summation order.
+            torch.testing.assert_close(p_fn.grad, p_oo.grad, atol=1e-5, rtol=1e-4)
 
     def test_depth_and_features_and_depth_match_oo(self):
         params = self._params()
@@ -170,6 +175,23 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         images.mean().backward()
         for p in (means, quats, log_scales, logit_opacities, sh0):
             self.assertGreater(float(p.grad.abs().max()), 0.0)
+
+        # OpenCV models need explicit distortion coefficients; zeros would silently render pinhole rays.
+        opencv = F.project_gaussians(
+            means.detach(),
+            quats.detach(),
+            log_scales.detach(),
+            self.w2c,
+            self.K,
+            self.W,
+            self.H,
+            camera_model=CameraModel.OPENCV_RADTAN_5,
+            distortion_coeffs=torch.zeros(self.C, 12, device=self.device),
+        )
+        with self.assertRaises(RuntimeError):
+            F.rasterize_world_space_gaussians(
+                means, quats, log_scales, opencv, features.detach(), logit_opacities, self.w2c, self.K, tiles
+            )
 
         params_oo = self._params()
         images_oo, alphas_oo = self._model(params_oo).render_images_from_world(
@@ -222,6 +244,11 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
                 projected, features, logit_opacities, sparse_tiles
             )
             self.assertEqual(len(rendered), self.C)
+            all_tiles = torch.ones_like(sparse_tiles.active_tile_mask)
+            same, _ = F.rasterize_screen_space_gaussians_sparse(
+                projected, features, logit_opacities, sparse_tiles, tile_masks=all_tiles
+            )
+            torch.testing.assert_close(same.jdata, rendered.jdata)
             for c in range(self.C):
                 px = pixels[c].jdata
                 self.assertEqual(tuple(rendered[c].jdata.shape), (px.shape[0], 3))
@@ -283,6 +310,25 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         torch.testing.assert_close(masked[:, : h // 2], crop[:, : h // 2], atol=1e-5, rtol=1e-5)
         self.assertEqual(float(masked[:, h // 2 :].abs().max()), 0.0)
         self.assertEqual(float(masked_alpha[:, h // 2 :].abs().max()), 0.0)
+        # A crop past the image edge is clipped, and a crop-space mask of the requested size still applies.
+        edge_w, edge_h = 50, 40
+        edge_mask = torch.ones(self.C, edge_h, edge_w, dtype=torch.bool, device=self.device)
+        edge, _ = model.render_from_projected_gaussians(
+            pg,
+            crop_width=edge_w,
+            crop_height=edge_h,
+            crop_origin_w=self.W - 30,
+            crop_origin_h=self.H - 25,
+            masks=edge_mask,
+        )
+        self.assertEqual(tuple(edge.shape[1:3]), (25, 30))
+        torch.testing.assert_close(edge, full[:, self.H - 25 :, self.W - 30 :], atol=1e-5, rtol=1e-5)
+        # Non-boolean masks are accepted with and without a crop.
+        float_mask = torch.ones(self.C, self.H, self.W, device=self.device)
+        with_float, _ = F.rasterize_screen_space_gaussians(
+            projected, features, logit_opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
+        )
+        torch.testing.assert_close(with_float, crop, atol=1e-5, rtol=1e-5)
 
     def test_analysis_matches_oo(self):
         params = self._params()
