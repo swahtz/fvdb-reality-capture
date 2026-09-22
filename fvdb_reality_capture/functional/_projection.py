@@ -1,0 +1,176 @@
+# Copyright Contributors to the OpenVDB Project
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Stage 1 of the composable pipeline: project 3D Gaussians into every camera."""
+
+from __future__ import annotations
+
+from typing import cast
+
+import torch
+from fvdb import functional as F
+
+from ..enums import CameraModel, ProjectionMethod
+from ._autograd import _ProjectGaussiansFn
+from ._types import ProjectedGaussians
+
+_OPENCV_MODELS = frozenset(
+    {
+        CameraModel.OPENCV_RADTAN_5,
+        CameraModel.OPENCV_RATIONAL_8,
+        CameraModel.OPENCV_RADTAN_THIN_PRISM_9,
+        CameraModel.OPENCV_THIN_PRISM_12,
+    }
+)
+
+
+def resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
+    """Replace :attr:`~fvdb_reality_capture.ProjectionMethod.AUTO` with the concrete method for a camera model.
+
+    Pinhole and orthographic cameras default to the analytic projection; the OpenCV distortion models
+    default to the unscented transform, which is the only method that supports them.
+
+    Args:
+        camera_model (CameraModel): The camera model.
+        projection_method (ProjectionMethod): The requested method, possibly ``AUTO``.
+
+    Returns:
+        projection_method (ProjectionMethod): ``ANALYTIC`` or ``UNSCENTED``.
+    """
+    if projection_method != ProjectionMethod.AUTO:
+        return ProjectionMethod(projection_method)
+    if camera_model in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
+        return ProjectionMethod.ANALYTIC
+    return ProjectionMethod.UNSCENTED
+
+
+def project_gaussians(
+    means: torch.Tensor,
+    quats: torch.Tensor,
+    log_scales: torch.Tensor,
+    world_to_camera_matrices: torch.Tensor,
+    projection_matrices: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    near: float = 0.01,
+    far: float = 1e10,
+    camera_model: CameraModel = CameraModel.PINHOLE,
+    projection_method: ProjectionMethod = ProjectionMethod.AUTO,
+    distortion_coeffs: torch.Tensor | None = None,
+    min_radius_2d: float = 0.0,
+    eps_2d: float = 0.3,
+    antialias: bool = False,
+    *,
+    accumulated_mean_2d_gradient_norms: torch.Tensor | None = None,
+    accumulated_gradient_step_counts: torch.Tensor | None = None,
+    accumulated_max_2d_radii: torch.Tensor | None = None,
+) -> ProjectedGaussians:
+    """Project 3D Gaussians onto the image planes of a set of cameras.
+
+    With the analytic method the result is differentiable with respect to ``means``, ``quats``,
+    ``log_scales`` and ``world_to_camera_matrices``. The unscented transform has no backward pass;
+    to train through it, rasterize with :func:`rasterize_world_space_gaussians`, which
+    differentiates through the 3D parameters directly.
+
+    Args:
+        means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
+        quats (torch.Tensor): Gaussian rotations as quaternions, ``[N, 4]``.
+        log_scales (torch.Tensor): Natural-log scale factors, ``[N, 3]``.
+        world_to_camera_matrices (torch.Tensor): World-to-camera transforms, ``[C, 4, 4]``, contiguous.
+        projection_matrices (torch.Tensor): Camera intrinsics, ``[C, 3, 3]``, contiguous.
+        image_width (int): Image width in pixels.
+        image_height (int): Image height in pixels.
+        near (float): Near clipping plane. Gaussians closer than this are culled.
+        far (float): Far clipping plane. Gaussians farther than this are culled.
+        camera_model (CameraModel): Camera model of all ``C`` cameras.
+        projection_method (ProjectionMethod): Projection method; ``AUTO`` picks per camera model.
+        distortion_coeffs (torch.Tensor | None): Packed OpenCV distortion coefficients, ``[C, 12]``,
+            contiguous. Required for the OpenCV camera models and ignored otherwise.
+        min_radius_2d (float): Gaussians whose projected radius is at most this many pixels are culled.
+        eps_2d (float): Blur added to the projected covariance for numerical stability.
+        antialias (bool): Compute opacity compensation factors for the blur added by ``eps_2d``.
+        accumulated_mean_2d_gradient_norms (torch.Tensor | None): Optional ``[N]`` float accumulator that
+            the analytic backward pass adds image-normalized 2D mean gradient norms into.
+        accumulated_gradient_step_counts (torch.Tensor | None): Optional ``[N]`` ``int32`` accumulator of
+            backward passes per Gaussian. Must be given together with the gradient-norm accumulator.
+        accumulated_max_2d_radii (torch.Tensor | None): Optional ``[N]`` ``int32`` accumulator of the
+            largest projected radius seen per Gaussian. Only updated alongside the other two.
+
+    Returns:
+        projected (ProjectedGaussians): The projected Gaussians.
+    """
+    if not projection_matrices.is_contiguous():
+        raise RuntimeError("projectionMatrices must be contiguous")
+    if not world_to_camera_matrices.is_contiguous():
+        raise RuntimeError("worldToCameraMatrices must be contiguous")
+    camera_model = CameraModel(camera_model)
+    num_cameras = world_to_camera_matrices.size(0)
+    if distortion_coeffs is not None:
+        if list(distortion_coeffs.shape) != [num_cameras, 12]:
+            raise RuntimeError(f"distortionCoeffs must have shape ({num_cameras}, 12)")
+        if not distortion_coeffs.is_contiguous():
+            raise RuntimeError("distortionCoeffs must be contiguous")
+
+    resolved = resolve_projection_method(camera_model, projection_method)
+    if camera_model in _OPENCV_MODELS:
+        if resolved != ProjectionMethod.UNSCENTED:
+            raise RuntimeError("OpenCV camera models require ProjectionMethod::UNSCENTED or AUTO")
+        if distortion_coeffs is None:
+            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
+
+    if resolved == ProjectionMethod.UNSCENTED:
+        if distortion_coeffs is None:
+            distortion_coeffs = torch.empty(num_cameras, 0, device=means.device, dtype=means.dtype)
+        radii, means2d, depths, conics, compensations = F.project_gaussians_ut_fwd(
+            means,
+            quats,
+            log_scales,
+            world_to_camera_matrices,
+            world_to_camera_matrices,
+            projection_matrices,
+            distortion_coeffs,
+            camera_model,
+            image_width,
+            image_height,
+            eps_2d,
+            near,
+            far,
+            min_radius_2d,
+            antialias,
+        )
+    else:
+        result = cast(
+            tuple[torch.Tensor, ...],
+            _ProjectGaussiansFn.apply(
+                means,
+                quats,
+                log_scales,
+                world_to_camera_matrices,
+                projection_matrices,
+                image_width,
+                image_height,
+                eps_2d,
+                near,
+                far,
+                min_radius_2d,
+                antialias,
+                camera_model == CameraModel.ORTHOGRAPHIC,
+                accumulated_mean_2d_gradient_norms,
+                accumulated_gradient_step_counts,
+                accumulated_max_2d_radii,
+            ),
+        )
+        radii, means2d, depths, conics = result[:4]
+        compensations = result[4] if antialias else None
+
+    return ProjectedGaussians(
+        radii=radii,
+        means2d=means2d,
+        depths=depths,
+        conics=conics,
+        compensations=compensations if antialias else None,
+        image_width=image_width,
+        image_height=image_height,
+        camera_model=camera_model,
+        projection_method=resolved,
+    )
