@@ -375,6 +375,57 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             for g, e in zip(got, expected):
                 self.assertTrue(torch.equal(g, e))
 
+    def test_single_camera_sparse_analysis_keeps_camera_nesting(self):
+        params = self._params()
+        means, quats, log_scales, logit_opacities, sh0, shN = params
+        w2c, K = self.w2c[:1], self.K[:1]
+        projected = F.project_gaussians(means, quats, log_scales, w2c, K, self.W, self.H)
+        pixels = self._pixels(with_duplicates=True)[0]  # one camera, duplicates included
+        pixels = JaggedTensor([pixels.jdata])
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, logit_opacities)
+        ids, weights = F.rasterize_contributing_gaussian_ids_sparse(projected, logit_opacities, sparse_tiles)
+        self.assertEqual(ids.ldim, 2)
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(len(ids[0].unbind()), pixels.jdata.shape[0])
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, logit_opacities, sparse_tiles)
+        self.assertEqual(int(ids.jdata.numel()), int(counts.jdata.sum()))
+
+    def test_precomputed_opacities_match_and_are_validated(self):
+        params = self._params()
+        means, quats, log_scales, logit_opacities, sh0, shN = params
+        projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        tiles = F.intersect_gaussian_tiles(projected, tile_size=16, opacities=opacities)
+        reference = F.intersect_gaussian_tiles(projected, logit_opacities, tile_size=16)
+        self.assertTrue(torch.equal(tiles.tile_offsets, reference.tile_offsets))
+        a, _ = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, opacities=opacities)
+        b, _ = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles)
+        torch.testing.assert_close(a, b)
+        with self.assertRaises(ValueError):
+            F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, opacities=opacities[:1])
+
+    def test_projected_splats_cache_tiles_and_reject_bad_crops(self):
+        model = self._model(self._params())
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        self.assertIs(pg.tile_intersection(16), pg.tile_intersection(16))
+        self.assertIsNot(pg.tile_intersection(16), pg.tile_intersection(32))
+        self.assertIs(pg.opacities, pg.opacities)
+        for origin_w, origin_h in ((self.W, 0), (0, self.H), (self.W + 5, self.H + 5)):
+            with self.assertRaises(ValueError):
+                model.render_from_projected_gaussians(
+                    pg, crop_width=10, crop_height=10, crop_origin_w=origin_w, crop_origin_h=origin_h
+                )
+            with self.assertRaises(ValueError):
+                model.render_from_projected_gaussians(
+                    pg,
+                    crop_width=10,
+                    crop_height=10,
+                    crop_origin_w=origin_w,
+                    crop_origin_h=origin_h,
+                    masks=torch.ones(self.C, 10, 10, dtype=torch.bool, device=self.device),
+                )
+
     def test_empty_selection(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params

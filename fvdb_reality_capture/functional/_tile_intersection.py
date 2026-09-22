@@ -20,9 +20,11 @@ def _tile_grid(image_width: int, image_height: int, tile_size: int) -> tuple[int
 
 
 def _culling_inputs(
-    projected: ProjectedGaussians, logit_opacities: torch.Tensor | None
+    projected: ProjectedGaussians, logit_opacities: torch.Tensor | None, opacities: torch.Tensor | None
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Conics and opacities for the tighter iso-contour tile test, or ``None`` for the bounding-box test."""
+    if opacities is not None:
+        return projected.conics, opacities.detach()
     if logit_opacities is None:
         return None, None
     with torch.no_grad():
@@ -33,6 +35,8 @@ def intersect_gaussian_tiles(
     projected: ProjectedGaussians,
     logit_opacities: torch.Tensor | None = None,
     tile_size: int = 16,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> GaussianTileIntersection:
     """Bin projected Gaussians into the tiles of the full image, sorted by camera, tile and depth.
 
@@ -44,12 +48,15 @@ def intersect_gaussian_tiles(
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         logit_opacities (torch.Tensor | None): Logit opacities, ``[N]``, for tighter culling.
         tile_size (int): Tile side length in pixels.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         tiles (GaussianTileIntersection): The tile intersections.
     """
     num_tiles_h, num_tiles_w = _tile_grid(projected.image_width, projected.image_height, tile_size)
-    conics, opacities = _culling_inputs(projected, logit_opacities)
+    conics, opacities = _culling_inputs(projected, logit_opacities, opacities)
     tile_offsets, tile_gaussian_ids = F.intersect_gaussian_tiles(
         projected.means2d,
         projected.radii,
@@ -151,6 +158,8 @@ def intersect_gaussian_tiles_sparse(
     projected: ProjectedGaussians,
     logit_opacities: torch.Tensor | None = None,
     tile_size: int = 16,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> SparseGaussianTileIntersection:
     """Bin projected Gaussians into only the tiles that contain requested pixels.
 
@@ -163,6 +172,9 @@ def intersect_gaussian_tiles_sparse(
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         logit_opacities (torch.Tensor | None): Logit opacities, ``[N]``, for tighter culling.
         tile_size (int): Tile side length in pixels. The sparse kernels require ``16``.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         sparse_tiles (SparseGaussianTileIntersection): The sparse tile intersections.
@@ -175,7 +187,7 @@ def intersect_gaussian_tiles_sparse(
     active_tiles, active_tile_mask, tile_pixel_mask, tile_pixel_cumsum, pixel_map = F.build_sparse_gaussian_tile_layout(
         tile_size, num_tiles_h, num_tiles_w, unique_pixels
     )
-    conics, opacities = _culling_inputs(projected, logit_opacities)
+    conics, opacities = _culling_inputs(projected, logit_opacities, opacities)
     tile_offsets, tile_gaussian_ids = F.intersect_gaussian_tiles_sparse(
         projected.means2d,
         projected.radii,

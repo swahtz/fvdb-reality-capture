@@ -101,6 +101,10 @@ Stage 4: Rasterization
 
 .. autofunction:: compute_gaussian_opacities
 
+.. autofunction:: resolve_opacities
+
+.. autofunction:: validate_crop
+
 .. autofunction:: pixel_mask_to_tile_mask
 
 

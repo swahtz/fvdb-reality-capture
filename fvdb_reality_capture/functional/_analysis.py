@@ -9,7 +9,7 @@ import torch
 from fvdb import JaggedTensor
 from fvdb import functional as F
 
-from ._opacity import compute_gaussian_opacities
+from ._opacity import resolve_opacities
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 
@@ -17,6 +17,8 @@ def rasterize_num_contributing_gaussians(
     projected: ProjectedGaussians,
     logit_opacities: torch.Tensor,
     tiles: GaussianTileIntersection,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Count the Gaussians that contribute non-negligible opacity to each pixel.
 
@@ -24,13 +26,16 @@ def rasterize_num_contributing_gaussians(
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
         tiles (GaussianTileIntersection): Output of :func:`intersect_gaussian_tiles` for ``projected``.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         num_contributing (torch.Tensor): Contributor count per pixel, ``[C, H, W]``, ``int32``.
         alphas (torch.Tensor): Accumulated alpha per pixel, ``[C, H, W]``.
     """
     with torch.no_grad():
-        return _count_dense(projected, compute_gaussian_opacities(logit_opacities, projected), tiles)
+        return _count_dense(projected, resolve_opacities(logit_opacities, projected, opacities), tiles)
 
 
 def _count_dense(
@@ -56,6 +61,8 @@ def rasterize_contributing_gaussian_ids(
     tiles: GaussianTileIntersection,
     top_k_contributors: int = 0,
     num_contributing: torch.Tensor | None = None,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """List the Gaussians contributing to each pixel, front to back, with their blend weights.
 
@@ -70,13 +77,16 @@ def rasterize_contributing_gaussian_ids(
         top_k_contributors (int): Contributors to keep per pixel, or ``0`` for all of them.
         num_contributing (torch.Tensor | None): Counts from :func:`rasterize_num_contributing_gaussians`,
             ``[C, H, W]``. Used only when ``top_k_contributors <= 0``.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         gaussian_ids (JaggedTensor): Contributor indices, nested as cameras, then pixels, then contributors.
         weights (JaggedTensor): Blend weight of each listed contributor, same structure.
     """
     with torch.no_grad():
-        opacities = compute_gaussian_opacities(logit_opacities, projected)
+        opacities = resolve_opacities(logit_opacities, projected, opacities)
         if top_k_contributors <= 0 and num_contributing is None:
             num_contributing, _ = _count_dense(projected, opacities, tiles)
         return F.rasterize_contributing_gaussian_ids(
@@ -99,6 +109,8 @@ def rasterize_num_contributing_gaussians_sparse(
     projected: ProjectedGaussians,
     logit_opacities: torch.Tensor,
     sparse_tiles: SparseGaussianTileIntersection,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """Count contributing Gaussians at the requested pixels only.
 
@@ -106,6 +118,9 @@ def rasterize_num_contributing_gaussians_sparse(
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
         sparse_tiles (SparseGaussianTileIntersection): Output of :func:`intersect_gaussian_tiles_sparse`.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         num_contributing (JaggedTensor): Contributor count per requested pixel, ``int32``, one list per camera.
@@ -113,7 +128,7 @@ def rasterize_num_contributing_gaussians_sparse(
     """
     with torch.no_grad():
         counts, alphas = _count_sparse_unique(
-            projected, compute_gaussian_opacities(logit_opacities, projected), sparse_tiles
+            projected, resolve_opacities(logit_opacities, projected, opacities), sparse_tiles
         )
     requested = sparse_tiles.pixels_to_render
     return (
@@ -162,8 +177,11 @@ def _expand_contributions(sparse_tiles: SparseGaussianTileIntersection, per_uniq
     within = torch.arange(int(offsets[-1].item()), device=device) - offsets[segment]
     gather = starts[segment] + within
     requested = sparse_tiles.pixels_to_render
-    camera = requested.jidx.to(device).long()
-    within_camera = torch.arange(camera.numel(), device=device) - requested.joffsets.to(device)[camera]
+    # jidx is empty for a single camera, so derive each pixel's camera from the offsets instead.
+    requested_offsets = requested.joffsets.to(device).long()
+    pixels_per_camera = requested_offsets[1:] - requested_offsets[:-1]
+    camera = torch.repeat_interleave(torch.arange(pixels_per_camera.numel(), device=device), pixels_per_camera)
+    within_camera = torch.arange(camera.numel(), device=device) - requested_offsets[camera]
     list_ids = torch.stack([camera, within_camera], dim=1).to(torch.int32)
     return JaggedTensor.from_data_offsets_and_list_ids(per_unique.jdata.index_select(0, gather), offsets, list_ids)
 
@@ -173,6 +191,8 @@ def rasterize_contributing_gaussian_ids_sparse(
     logit_opacities: torch.Tensor,
     sparse_tiles: SparseGaussianTileIntersection,
     top_k_contributors: int = 0,
+    *,
+    opacities: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """List contributing Gaussians, with blend weights, at the requested pixels only.
 
@@ -184,13 +204,16 @@ def rasterize_contributing_gaussian_ids_sparse(
         logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
         sparse_tiles (SparseGaussianTileIntersection): Output of :func:`intersect_gaussian_tiles_sparse`.
         top_k_contributors (int): Contributors to keep per pixel, or ``0`` for all of them.
+        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
+            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
+            ``logit_opacities`` when ``None``.
 
     Returns:
         gaussian_ids (JaggedTensor): Contributor indices, nested as cameras, then pixels, then contributors.
         weights (JaggedTensor): Blend weight of each listed contributor, same structure.
     """
     with torch.no_grad():
-        opacities = compute_gaussian_opacities(logit_opacities, projected)
+        opacities = resolve_opacities(logit_opacities, projected, opacities)
         num_contributing = None
         if top_k_contributors <= 0:
             num_contributing, _ = _count_sparse_unique(projected, opacities, sparse_tiles)

@@ -16,10 +16,10 @@ from fvdb.types import DeviceIdentifier, cast_check, resolve_device
 
 from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
+    GaussianTileIntersection,
     ProjectedGaussians,
     as_pixel_jagged,
     compute_gaussian_opacities,
-    deduplicate_pixels,
     evaluate_gaussian_sh,
     intersect_gaussian_tiles,
     intersect_gaussian_tiles_sparse,
@@ -31,6 +31,7 @@ from ..functional import (
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
     rasterize_world_space_gaussians,
+    validate_crop,
 )
 from ..functional._autograd import (
     _EvaluateGaussianSHFn,
@@ -88,6 +89,7 @@ class ProjectedGaussianSplats:
         self._min_radius_2d = min_radius_2d
         self._sh_degree_to_use = sh_degree_to_use
         self._opacities: torch.Tensor | None = None
+        self._tiles: dict[int, GaussianTileIntersection] = {}
 
     @property
     def projected_gaussians(self) -> ProjectedGaussians:
@@ -99,6 +101,24 @@ class ProjectedGaussianSplats:
             projected_gaussians (ProjectedGaussians): The projected Gaussians without features or opacities.
         """
         return self._projected
+
+    def tile_intersection(self, tile_size: int = 16) -> GaussianTileIntersection:
+        """
+        Return the tile intersections of the projected Gaussians for a tile size, computing them once and
+        caching the result, so that rendering several crops from one projection does not repeat the work.
+
+        Args:
+            tile_size (int): The tile side length in pixels. Default is 16.
+
+        Returns:
+            tiles (GaussianTileIntersection): The tile intersections, as consumed by the rasterization stages
+                in :mod:`fvdb_reality_capture.functional`.
+        """
+        tiles = self._tiles.get(tile_size)
+        if tiles is None:
+            tiles = intersect_gaussian_tiles(self._projected, tile_size=tile_size, opacities=self.opacities)
+            self._tiles[tile_size] = tiles
+        return tiles
 
     @property
     def logit_opacities(self) -> torch.Tensor:
@@ -1421,13 +1441,6 @@ class GaussianSplat3d:
     #  Private rendering helpers
     # ---------------------------------------------------------------------------
 
-    @staticmethod
-    def _deduplicate_pixels(
-        pixels_jt: JaggedTensor, image_width: int, image_height: int
-    ) -> tuple[JaggedTensor, torch.Tensor, bool]:
-        """Per-camera pixel deduplication; see :func:`fvdb_reality_capture.functional.deduplicate_pixels`."""
-        return deduplicate_pixels(pixels_jt, image_width, image_height)
-
     def _projection_accumulators(self) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Create the enabled densification accumulators if missing or stale and return them."""
         num_gaussians = self.num_gaussians
@@ -1586,7 +1599,8 @@ class GaussianSplat3d:
             antialias,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
-        tiles = intersect_gaussian_tiles(projected, self._logit_opacities, tile_size)
+        opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+        tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
         if world_space:
             return rasterize_world_space_gaussians(
                 self._means,
@@ -1601,9 +1615,10 @@ class GaussianSplat3d:
                 distortion_coeffs=distortion_coeffs,
                 backgrounds=backgrounds,
                 masks=masks,
+                opacities=opacities,
             )
         return rasterize_screen_space_gaussians(
-            projected, features, self._logit_opacities, tiles, backgrounds=backgrounds, masks=masks
+            projected, features, self._logit_opacities, tiles, backgrounds=backgrounds, masks=masks, opacities=opacities
         )
 
     def _render_sparse(
@@ -1643,9 +1658,18 @@ class GaussianSplat3d:
             antialias,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
-        sparse_tiles = intersect_gaussian_tiles_sparse(pixels_to_render, projected, self._logit_opacities, tile_size)
+        opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+        sparse_tiles = intersect_gaussian_tiles_sparse(
+            pixels_to_render, projected, tile_size=tile_size, opacities=opacities
+        )
         return rasterize_screen_space_gaussians_sparse(
-            projected, features, self._logit_opacities, sparse_tiles, backgrounds=backgrounds, tile_masks=masks
+            projected,
+            features,
+            self._logit_opacities,
+            sparse_tiles,
+            backgrounds=backgrounds,
+            tile_masks=masks,
+            opacities=opacities,
         )
 
     @staticmethod
@@ -2083,27 +2107,28 @@ class GaussianSplat3d:
         crop_h = crop_height if crop_height > 0 else height
         origin_w = crop_origin_w if crop_origin_w >= 0 else 0
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
-        # Crops are clipped to the image, so the output can be smaller than requested at the edges.
-        crop_w = min(crop_w, width - origin_w)
-        crop_h = min(crop_h, height - origin_h)
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
-        crop = (origin_w, origin_h, crop_w, crop_h) if is_crop else None
+        crop = None
         full_masks = masks
-        if masks is not None and is_crop:
-            # The mask is given in crop coordinates; embed its clipped region in the full image.
-            full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
-            full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
-                :, :crop_h, :crop_w
-            ].bool()
-        tiles = intersect_gaussian_tiles(projected, pg.logit_opacities, tile_size)
+        if is_crop:
+            # Rejects crops outside the image; clips the size at the image edge.
+            crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
+            origin_w, origin_h, crop_w, crop_h = crop
+            if masks is not None:
+                # The mask is given in crop coordinates; embed its clipped region in the full image.
+                full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
+                full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
+                    :, :crop_h, :crop_w
+                ].bool()
         return rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
             pg.logit_opacities,
-            tiles,
+            pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
             masks=full_masks,
             crop=crop,
+            opacities=pg.opacities,
         )
 
     def render_depths(
@@ -3050,8 +3075,9 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            tiles = intersect_gaussian_tiles(projected, self._logit_opacities, tile_size)
-            return rasterize_num_contributing_gaussians(projected, self._logit_opacities, tiles)
+            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+            tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
+            return rasterize_num_contributing_gaussians(projected, self._logit_opacities, tiles, opacities=opacities)
 
     @overload
     def sparse_render_num_contributing_gaussians(
@@ -3171,8 +3197,13 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            sparse_tiles = intersect_gaussian_tiles_sparse(pixels_jt, projected, self._logit_opacities, tile_size)
-            counts, alphas = rasterize_num_contributing_gaussians_sparse(projected, self._logit_opacities, sparse_tiles)
+            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+            sparse_tiles = intersect_gaussian_tiles_sparse(
+                pixels_jt, projected, tile_size=tile_size, opacities=opacities
+            )
+            counts, alphas = rasterize_num_contributing_gaussians_sparse(
+                projected, self._logit_opacities, sparse_tiles, opacities=opacities
+            )
         return self._sparse_result(pixels_to_render, counts, alphas)
 
     def render_contributing_gaussian_ids(
@@ -3251,8 +3282,11 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            tiles = intersect_gaussian_tiles(projected, self._logit_opacities, tile_size)
-            return rasterize_contributing_gaussian_ids(projected, self._logit_opacities, tiles, top_k_contributors)
+            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+            tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
+            return rasterize_contributing_gaussian_ids(
+                projected, self._logit_opacities, tiles, top_k_contributors, opacities=opacities
+            )
 
     @overload
     def sparse_render_contributing_gaussian_ids(
@@ -3371,9 +3405,12 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            sparse_tiles = intersect_gaussian_tiles_sparse(pixels_jt, projected, self._logit_opacities, tile_size)
+            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
+            sparse_tiles = intersect_gaussian_tiles_sparse(
+                pixels_jt, projected, tile_size=tile_size, opacities=opacities
+            )
             return rasterize_contributing_gaussian_ids_sparse(
-                projected, self._logit_opacities, sparse_tiles, top_k_contributors
+                projected, self._logit_opacities, sparse_tiles, top_k_contributors, opacities=opacities
             )
 
     def relocate_gaussians(

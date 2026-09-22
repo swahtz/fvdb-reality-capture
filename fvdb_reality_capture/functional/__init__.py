@@ -23,13 +23,14 @@ from ._analysis import (
     rasterize_num_contributing_gaussians,
     rasterize_num_contributing_gaussians_sparse,
 )
-from ._opacity import compute_gaussian_opacities
+from ._opacity import compute_gaussian_opacities, resolve_opacities
 from ._projection import project_gaussians, resolve_projection_method
 from ._rasterization import (
     pixel_mask_to_tile_mask,
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
     rasterize_world_space_gaussians,
+    validate_crop,
 )
 from ._spherical_harmonics import evaluate_gaussian_sh, sh_degree_from_coefficients
 from ._tile_intersection import (
@@ -61,7 +62,9 @@ __all__ = [
     "rasterize_world_space_gaussians",
     "rasterize_screen_space_gaussians_sparse",
     "compute_gaussian_opacities",
+    "resolve_opacities",
     "pixel_mask_to_tile_mask",
+    "validate_crop",
     # Analysis
     "rasterize_num_contributing_gaussians",
     "rasterize_num_contributing_gaussians_sparse",
