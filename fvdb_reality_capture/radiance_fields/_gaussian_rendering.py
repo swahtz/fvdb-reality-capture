@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import torch
 
 from ..enums import CameraModel, ProjectionMethod
+from ..functional._projection import resolve_projection_method
 
 from .gaussian_splat_dataset import SfmDataset
-from .gaussian_splatting import GaussianSplat3d
+from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats
 
 if TYPE_CHECKING:
     from .gaussian_splat_reconstruction import GaussianSplatReconstructionConfig
@@ -36,6 +37,72 @@ class RenderOutputs:
 
 
 RenderBackendName = Literal["image_space", "world_space"]
+
+Crop = tuple[int, int, int, int]
+
+
+class TrainingView(Protocol):
+    """
+    The per-image part of a training forward pass, ready to render any number of crops.
+
+    A backend does the work that does not depend on the crop once per view (projection for the
+    image-space backend, the full render for the world-space one) and returns one of these, so the
+    training loop can render each crop without repeating it.
+    """
+
+    def render_crop(self, crop: Crop) -> RenderOutputs:
+        """
+        Render one crop of this view.
+
+        Args:
+            crop (tuple[int, int, int, int]): Crop rectangle as ``(origin_w, origin_h, width, height)``.
+
+        Returns:
+            RenderOutputs: The rendered crop, alpha image, and optional depth image.
+        """
+        ...
+
+
+def _split_render_outputs(rendered: torch.Tensor, alpha: torch.Tensor, num_channels: int) -> RenderOutputs:
+    image = rendered[..., :num_channels]
+    depth = rendered[..., -1:] if rendered.shape[-1] == num_channels + 1 else None
+    return RenderOutputs(image=image, alpha=alpha, depth=depth)
+
+
+@dataclass
+class _ProjectedTrainingView:
+    """Image-space view: the Gaussians are projected once, each crop rasterizes from that projection."""
+
+    model: GaussianSplat3d
+    projected_gaussians: ProjectedGaussianSplats
+    tile_size: int
+
+    def render_crop(self, crop: Crop) -> RenderOutputs:
+        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
+        rendered, alphas = self.model.render_from_projected_gaussians(
+            self.projected_gaussians,
+            crop_width=crop_w,
+            crop_height=crop_h,
+            crop_origin_w=crop_origin_w,
+            crop_origin_h=crop_origin_h,
+            tile_size=self.tile_size,
+        )
+        return _split_render_outputs(rendered, alphas, self.model.num_channels)
+
+
+@dataclass
+class _RenderedTrainingView:
+    """World-space view: the full image is rendered once, each crop is a slice of it."""
+
+    rendered: torch.Tensor
+    alpha: torch.Tensor
+    num_channels: int
+
+    def render_crop(self, crop: Crop) -> RenderOutputs:
+        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
+        rendered = self.rendered[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
+        alpha = self.alpha[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
+        return _split_render_outputs(rendered, alpha, self.num_channels)
 
 
 def projection_method_from_config(value: str) -> ProjectionMethod:
@@ -106,10 +173,9 @@ class RenderBackend(Protocol):
         image_width: int,
         image_height: int,
         sh_degree_to_use: int,
-        crop: tuple[int, int, int, int],
-    ) -> RenderOutputs:
+    ) -> TrainingView:
         """
-        Render a training crop and return the tensors needed for loss computation.
+        Do the per-image work of a training forward pass and return a view that renders its crops.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model to render.
@@ -121,10 +187,9 @@ class RenderBackend(Protocol):
             image_width (int): Full image width in pixels before cropping.
             image_height (int): Full image height in pixels before cropping.
             sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-            crop (tuple[int, int, int, int]): Crop rectangle as ``(origin_w, origin_h, width, height)``.
 
         Returns:
-            RenderOutputs: The rendered training crop, alpha image, and optional depth image.
+            TrainingView: Renders any crop of this view via :meth:`TrainingView.render_crop`.
         """
         ...
 
@@ -179,14 +244,29 @@ class ImageSpaceRenderBackend:
         """
         Probe the scene cameras to ensure image-space rendering supports them.
 
+        Cameras that resolve to the unscented projection are rejected. That projection is forward-only,
+        so rasterizing from it would train features and opacities while the Gaussian geometry received
+        no gradient at all; the world-space backend differentiates through those cameras directly.
+
         Args:
             model (GaussianSplat3d): Gaussian splat model used for the probe render.
             dataset (SfmDataset): Dataset whose cameras should be validated.
             config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
             device (torch.device): Device on which validation probes should run.
         """
-        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
+        camera_models = torch.unique(torch.from_numpy(dataset.camera_models))
+        if config.batch_size > 1 and camera_models.numel() > 1:
             raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+        projection_method = projection_method_from_config(config.projection_method)
+        for camera_model in camera_models.tolist():
+            camera_model_enum = CameraModel(int(camera_model))
+            if resolve_projection_method(camera_model_enum, projection_method) == ProjectionMethod.UNSCENTED:
+                raise ValueError(
+                    f"The image-space render backend cannot train {camera_model_enum.name} cameras with the "
+                    f"{config.projection_method!r} projection method: the unscented projection is forward-only, so "
+                    "the Gaussian geometry would receive no gradient. "
+                    'Use render_backend="world_space", which differentiates through these cameras directly.'
+                )
         self._probe(model, dataset, config, device, render_depth=_needs_depth_render(config))
 
     def forward_train(
@@ -200,14 +280,13 @@ class ImageSpaceRenderBackend:
         image_width: int,
         image_height: int,
         sh_degree_to_use: int,
-        crop: tuple[int, int, int, int],
-    ) -> RenderOutputs:
+    ) -> TrainingView:
         """
-        Render a cropped training view using image-space projection and rasterization.
+        Project the Gaussians into the target cameras once; the returned view rasterizes each crop.
 
-        This path first projects Gaussians into the target camera, then rasterizes just the
-        requested crop window. If sparse depth regularization is enabled, it uses the FVDB API
-        that also produces a depth channel.
+        If depth regularization is enabled, the projection also carries the depth channel. Tile
+        intersections and opacities are cached on the projection, so rendering several crops repeats
+        only the rasterization.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model to render.
@@ -219,10 +298,9 @@ class ImageSpaceRenderBackend:
             image_width (int): Full image width in pixels before cropping.
             image_height (int): Full image height in pixels before cropping.
             sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-            crop (tuple[int, int, int, int]): Crop rectangle as ``(origin_w, origin_h, width, height)``.
 
         Returns:
-            RenderOutputs: The rendered crop, alpha image, and optional depth image.
+            TrainingView: Renders any crop of this view from the shared projection.
         """
         camera_model = _camera_model_from_batch(camera_models)
         distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
@@ -247,18 +325,7 @@ class ImageSpaceRenderBackend:
             eps_2d=config.eps_2d,
             antialias=config.antialias,
         )
-        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
-        rendered, alphas = model.render_from_projected_gaussians(
-            projected_gaussians,
-            crop_width=crop_w,
-            crop_height=crop_h,
-            crop_origin_w=crop_origin_w,
-            crop_origin_h=crop_origin_h,
-            tile_size=config.tile_size,
-        )
-        image = rendered[..., : model.num_channels]
-        depth = rendered[..., -1:] if rendered.shape[-1] == model.num_channels + 1 else None
-        return RenderOutputs(image=image, alpha=alphas, depth=depth)
+        return _ProjectedTrainingView(model=model, projected_gaussians=projected_gaussians, tile_size=config.tile_size)
 
     def forward_eval(
         self,
@@ -466,14 +533,13 @@ class WorldSpaceRenderBackend:
         image_width: int,
         image_height: int,
         sh_degree_to_use: int,
-        crop: tuple[int, int, int, int],
-    ) -> RenderOutputs:
+    ) -> TrainingView:
         """
-        Render a cropped training view directly from world-space Gaussians.
+        Render the full training view directly from world-space Gaussians; the returned view slices crops.
 
-        The world-space renderer produces a full image for the requested camera batch, after which
-        this backend slices out the requested crop region so the rest of the reconstruction code
-        can work with the same crop-based interface as the image-space backend.
+        The world-space renderer has no projection stage to share between crops, so the full image
+        is rendered once and each crop is a slice of it, which keeps the crop-based training loop
+        uniform across backends.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model to render.
@@ -485,10 +551,9 @@ class WorldSpaceRenderBackend:
             image_width (int): Full image width in pixels before cropping.
             image_height (int): Full image height in pixels before cropping.
             sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-            crop (tuple[int, int, int, int]): Crop rectangle as ``(origin_w, origin_h, width, height)``.
 
         Returns:
-            RenderOutputs: The rendered crop, alpha image, and optional depth image.
+            TrainingView: Slices any crop out of the rendered view.
         """
         camera_model = _camera_model_from_batch(camera_models)
         distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
@@ -511,12 +576,7 @@ class WorldSpaceRenderBackend:
             eps_2d=config.eps_2d,
             antialias=config.antialias,
         )
-        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
-        rendered = rendered[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
-        alpha = alpha[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
-        image = rendered[..., : model.num_channels]
-        depth = rendered[..., -1:] if rendered.shape[-1] == model.num_channels + 1 else None
-        return RenderOutputs(image=image, alpha=alpha, depth=depth)
+        return _RenderedTrainingView(rendered=rendered, alpha=alpha, num_channels=model.num_channels)
 
     def forward_eval(
         self,

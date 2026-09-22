@@ -87,15 +87,22 @@ def as_pixel_jagged(pixels_to_render: JaggedTensor | torch.Tensor) -> JaggedTens
     Returns:
         pixels (JaggedTensor): The selection as a JaggedTensor.
     """
-    if isinstance(pixels_to_render, JaggedTensor):
-        return pixels_to_render
     if isinstance(pixels_to_render, torch.Tensor):
-        if pixels_to_render.dim() != 3 or pixels_to_render.shape[-1] != 2:
-            raise ValueError(f"pixels_to_render tensor must have shape [C, P, 2], got {tuple(pixels_to_render.shape)}")
-        return JaggedTensor(list(pixels_to_render.unbind(0)))
-    raise TypeError(
-        f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(pixels_to_render).__name__}"
-    )
+        if pixels_to_render.dim() != 3 or pixels_to_render.shape[0] == 0 or pixels_to_render.shape[-1] != 2:
+            raise ValueError(
+                f"pixels_to_render tensor must have shape [C, P, 2] with C > 0, got {tuple(pixels_to_render.shape)}"
+            )
+        pixels_to_render = JaggedTensor(list(pixels_to_render.unbind(0)))
+    elif not isinstance(pixels_to_render, JaggedTensor):
+        raise TypeError(
+            f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(pixels_to_render).__name__}"
+        )
+    coords = pixels_to_render.jdata
+    if coords.dim() != 2 or coords.shape[1] != 2:
+        raise ValueError(f"pixels_to_render elements must be (row, col) pairs, got jdata shape {tuple(coords.shape)}")
+    if coords.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
+    return pixels_to_render
 
 
 def deduplicate_pixels(
@@ -109,7 +116,9 @@ def deduplicate_pixels(
         image_height (int): Image height, used to linearize pixel coordinates.
 
     Returns:
-        unique_pixels (JaggedTensor): The pixels with duplicates removed, first occurrence kept in order.
+        unique_pixels (JaggedTensor): The pixels with duplicates removed. Each pixel's first occurrence
+            is kept, and the unique pixels are in the order they were first requested. Pixels outside
+            the image are never merged with anything.
         inverse_indices (torch.Tensor): For each flat requested pixel, its index into the flat unique pixels.
         has_duplicates (bool): Whether anything was removed. When ``False`` the input is returned as is.
     """
@@ -121,13 +130,21 @@ def deduplicate_pixels(
 
     jidx = pixels_to_render.jidx
     single_list = jidx.shape[0] == 0
+    num_lists = pixels_to_render.num_tensors
     rows = jdata[:, 0].long()
     cols = jdata[:, 1].long()
     keys = rows * image_width + cols
     if not single_list:
         keys = keys + jidx.long() * (image_height * image_width)
+    # Linearizing (row, col) aliases pixels outside the image onto valid ones, e.g. (0, W) onto (1, 0).
+    # Give each such pixel a key of its own so it is never merged into a valid pixel's output and the
+    # layout kernel's bounds check still sees it.
+    in_image = (rows >= 0) & (rows < image_height) & (cols >= 0) & (cols < image_width)
+    out_of_image_keys = num_lists * image_height * image_width + torch.arange(total_pixels, device=device)
+    keys = torch.where(in_image, keys, out_of_image_keys)
 
-    sorted_keys, sort_perm = keys.sort()
+    # A stable sort puts each pixel's first occurrence first within its group of duplicates.
+    sorted_keys, sort_perm = keys.sort(stable=True)
     is_group_start = torch.ones(total_pixels, dtype=torch.bool, device=device)
     if total_pixels > 1:
         is_group_start[1:] = sorted_keys[1:] != sorted_keys[:-1]
@@ -136,12 +153,14 @@ def deduplicate_pixels(
     if num_unique == total_pixels:
         return pixels_to_render, torch.arange(total_pixels, dtype=torch.long, device=device), False
 
+    # Order the unique pixels by first request rather than by sorted key, and remap the groups to match.
+    unique_orig_indices, order = sort_perm[is_group_start].sort()
+    rank = torch.empty(num_unique, dtype=torch.long, device=device)
+    rank[order] = torch.arange(num_unique, device=device)
     inverse_indices = torch.empty(total_pixels, dtype=torch.long, device=device)
-    inverse_indices[sort_perm] = group_ids
-    unique_orig_indices = sort_perm[is_group_start.nonzero(as_tuple=False).squeeze(1)]
+    inverse_indices[sort_perm] = rank[group_ids]
     unique_jdata = jdata[unique_orig_indices]
 
-    num_lists = pixels_to_render.num_tensors
     if single_list:
         unique_batch_idx = torch.zeros(num_unique, dtype=torch.long, device=device)
     else:

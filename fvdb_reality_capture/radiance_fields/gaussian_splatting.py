@@ -250,9 +250,17 @@ class ProjectedGaussianSplats:
             opacities (torch.Tensor): A tensor of shape ``(C, N)`` representing the opacity of each projected Gaussian, where
                 ``C`` is the number of image planes, and ``N`` is the number of projected Gaussians.
         """
-        if self._opacities is None:
-            self._opacities = compute_gaussian_opacities(self._logit_opacities, self._projected)
-        return self._opacities
+        opacities = self._opacities
+        compensations = self._projected.compensations
+        wants_graph = torch.is_grad_enabled() and (
+            self._logit_opacities.requires_grad or (compensations is not None and compensations.requires_grad)
+        )
+        # A copy cached under no_grad (a preview render, say) carries no graph. Recompute rather than
+        # hand it to a training render, which would silently drop the opacity gradient.
+        if opacities is None or (wants_graph and not opacities.requires_grad):
+            opacities = compute_gaussian_opacities(self._logit_opacities, self._projected)
+            self._opacities = opacities
+        return opacities
 
     @property
     def camera_model(self) -> CameraModel:

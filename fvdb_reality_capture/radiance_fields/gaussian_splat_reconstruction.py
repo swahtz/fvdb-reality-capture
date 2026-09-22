@@ -179,8 +179,11 @@ class GaussianSplatReconstructionConfig:
 
     crops_per_image: int = 1
     """
-    Number of crops to use per image during reconstruction. If you're using very large images, you can set this to a value greater than 1
-    to run the forward pass on crops and accumulate gradients. This can help reduce memory usage.
+    Number of crops per side to split each image into during reconstruction, so ``2`` renders four crops.
+    Gradients accumulate across the crops of an image. The Gaussians are projected once per image and
+    every crop rasterizes from that projection, skipping tiles outside the crop. The raster output
+    buffers are still allocated at full image size (openvdb/fvdb-core#800), so this reduces peak
+    memory less than the crop area alone would suggest.
 
     Default: ``1`` (no cropping, use full images).
     """
@@ -1412,26 +1415,26 @@ class GaussianSplatReconstruction:
 
                 # Progressively use higher spherical harmonic degree as we optimize
                 sh_degree_to_use = min(self._global_step // increase_sh_degree_every_step, self.config.sh_degree)
+                # The crop-independent work (projection, or the full render for the world-space backend)
+                # runs once per view; each crop below renders from it.
+                training_view = self._render_backend.forward_train(
+                    model=self.model,
+                    config=self.config,
+                    world_to_camera_matrices=world_to_cam_mats,
+                    projection_matrices=projection_mats,
+                    camera_models=camera_models,
+                    distortion_coeffs=distortion_coeffs,
+                    image_width=image_width,
+                    image_height=image_height,
+                    sh_degree_to_use=sh_degree_to_use,
+                )
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
                 for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
                     # Actual pixels to compute the loss on, normalized to [0, 1]
                     pixels: torch.Tensor = pixels.to(device=self.device) / 255.0  # [1, H, W, 3]
 
-                    # Render an image from the gaussian splats
-                    # possibly using a crop of the full image
-                    render_outputs = self._render_backend.forward_train(
-                        model=self.model,
-                        config=self.config,
-                        world_to_camera_matrices=world_to_cam_mats,
-                        projection_matrices=projection_mats,
-                        camera_models=camera_models,
-                        distortion_coeffs=distortion_coeffs,
-                        image_width=image_width,
-                        image_height=image_height,
-                        sh_degree_to_use=sh_degree_to_use,
-                        crop=crop,
-                    )
+                    render_outputs = training_view.render_crop(crop)
                     image = render_outputs.image
 
                     # If you want to add random background, we'll mix it in here

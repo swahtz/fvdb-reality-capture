@@ -45,12 +45,17 @@ def resolve_opacities(
         opacities (torch.Tensor | None): Precomputed opacities, shape ``[C, N]``, or ``None``.
 
     Returns:
-        opacities (torch.Tensor): Opacities in ``[0, 1]``, shape ``[C, N]``.
+        opacities (torch.Tensor): Opacities in ``[0, 1]``, shape ``[C, N]``, contiguous and on the
+            projection's device.
     """
     if opacities is not None:
         if tuple(opacities.shape) != (projected.num_cameras, projected.num_gaussians):
             raise ValueError(
                 f"opacities must have shape [{projected.num_cameras}, {projected.num_gaussians}], got {tuple(opacities.shape)}"
             )
-        return opacities
+        if opacities.device != projected.means2d.device:
+            raise ValueError(f"opacities must be on {projected.means2d.device}, got {opacities.device}")
+        # The kernels index a dense [C, N] buffer, so an expanded or strided view is materialized here
+        # rather than failing inside the kernel.
+        return opacities.contiguous()
     return compute_gaussian_opacities(logit_opacities, projected)
