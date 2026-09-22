@@ -1,15 +1,15 @@
 Enums
 =====
 
-The camera and Gaussian-splatting enums are provided by
-``fvdb_reality_capture``. Their member values remain compatible with the
-underlying compiled fVDB kernels.
+The camera enums are owned by ``fvdb`` and re-exported by ``fvdb_reality_capture`` as the same
+objects, so values pass between the two packages without conversion:
 
-.. autoclass:: fvdb_reality_capture.RollingShutterType
-   :members:
+- :class:`fvdb.CameraModel` (also available as ``fvdb_reality_capture.CameraModel``)
+- :class:`fvdb.ProjectionMethod` (also available as ``fvdb_reality_capture.ProjectionMethod``)
+- :class:`fvdb.RollingShutterType` (also available as ``fvdb_reality_capture.RollingShutterType``)
 
-.. autoclass:: fvdb_reality_capture.CameraModel
-   :members:
+:class:`GaussianRenderMode` belongs to the composable rendering pipeline in
+:mod:`fvdb_reality_capture.functional`.
 
-.. autoclass:: fvdb_reality_capture.ProjectionMethod
+.. autoclass:: fvdb_reality_capture.GaussianRenderMode
    :members:

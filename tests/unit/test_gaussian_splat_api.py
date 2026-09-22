@@ -20,21 +20,28 @@ def test_gaussian_splat_api_is_owned_by_reality_capture():
         assert hasattr(fvdb_reality_capture, symbol)
         assert not hasattr(fvdb, symbol)
 
+    # The composable pipeline lives here; fvdb.functional only has the flat kernel wrappers.
+    for symbol in ("project_gaussians", "evaluate_gaussian_sh", "ProjectedGaussians"):
+        assert hasattr(fvdb_reality_capture.functional, symbol)
+        assert not hasattr(fvdb.functional, symbol)
 
-def test_gaussian_splat_enums_are_owned_by_reality_capture_with_preserved_values():
+
+def test_gaussian_splat_enums_are_shared_with_fvdb_with_preserved_values():
     import fvdb
     import fvdb.viz
     import fvdb_reality_capture
 
-    public_enums = (
-        "RollingShutterType",
-        "CameraModel",
-        "ProjectionMethod",
-    )
+    # The camera enums are owned by fvdb-core and re-exported here as the same objects, so
+    # values round-trip between the two packages without conversion.
+    for enum_name in ("RollingShutterType", "CameraModel", "ProjectionMethod"):
+        assert getattr(fvdb_reality_capture, enum_name) is getattr(fvdb, enum_name)
 
-    for enum_name in public_enums:
-        assert hasattr(fvdb_reality_capture, enum_name)
-        assert not hasattr(fvdb, enum_name)
+    assert not hasattr(fvdb, "GaussianRenderMode")
+    assert {member.name: member.value for member in fvdb_reality_capture.GaussianRenderMode} == {
+        "FEATURES": 0,
+        "DEPTH": 1,
+        "FEATURES_AND_DEPTH": 2,
+    }
 
     assert not hasattr(fvdb_reality_capture, "ShOrderingMode")
 
