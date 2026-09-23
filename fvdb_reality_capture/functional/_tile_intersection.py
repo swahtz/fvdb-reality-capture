@@ -10,6 +10,7 @@ import math
 import torch
 from fvdb import JaggedTensor
 from fvdb import functional as F
+from fvdb.functional import as_pixel_jagged
 
 from ._opacity import check_opacities
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
@@ -68,34 +69,6 @@ def intersect_gaussian_tiles(
         image_width=projected.image_width,
         image_height=projected.image_height,
     )
-
-
-def as_pixel_jagged(pixels_to_render: JaggedTensor | torch.Tensor) -> JaggedTensor:
-    """Normalize a pixel selection to a JaggedTensor with one ``[P_c, 2]`` list of ``(row, col)`` per camera.
-
-    Args:
-        pixels_to_render (JaggedTensor | torch.Tensor): A JaggedTensor, returned as is, or a ``[C, P, 2]``
-            tensor with the same number of pixels for every camera.
-
-    Returns:
-        pixels (JaggedTensor): The selection as a JaggedTensor.
-    """
-    if isinstance(pixels_to_render, torch.Tensor):
-        if pixels_to_render.dim() != 3 or pixels_to_render.shape[0] == 0 or pixels_to_render.shape[-1] != 2:
-            raise ValueError(
-                f"pixels_to_render tensor must have shape [C, P, 2] with C > 0, got {tuple(pixels_to_render.shape)}"
-            )
-        pixels_to_render = JaggedTensor(list(pixels_to_render.unbind(0)))
-    elif not isinstance(pixels_to_render, JaggedTensor):
-        raise TypeError(
-            f"pixels_to_render must be a fvdb.JaggedTensor or torch.Tensor, got {type(pixels_to_render).__name__}"
-        )
-    coords = pixels_to_render.jdata
-    if coords.dim() != 2 or coords.shape[1] != 2:
-        raise ValueError(f"pixels_to_render elements must be (row, col) pairs, got jdata shape {tuple(coords.shape)}")
-    if coords.dtype not in (torch.int32, torch.int64):
-        raise TypeError(f"pixels_to_render must be int32 or int64, got {coords.dtype}")
-    return pixels_to_render
 
 
 def deduplicate_pixels(
