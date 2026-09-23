@@ -855,18 +855,18 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         # We use the average norm of the gradients of the projected Gaussians with respect to the
         # loss (accumulated since the last refinement step) to decide which Gaussians to duplicate or split.
 
-        # Guard against None gradient accumulation tensors. This can happen when a projection method
-        # (e.g., Unscented Transform for OpenCV camera models) does not accumulate 2D mean gradients.
-        if (
-            self._model.accumulated_gradient_step_counts is None
-            or self._model.accumulated_mean_2d_gradient_norms is None
-        ):
+        # Only the analytic projection's backward pass fills the 2D gradient accumulators. With the
+        # unscented transform (OpenCV camera models, or world-space rendering) the model still holds the
+        # tensors, zeroed, so check that something was accumulated rather than that they exist.
+        step_counts = self._model.accumulated_gradient_step_counts
+        grad_norms = self._model.accumulated_mean_2d_gradient_norms
+        if step_counts is None or grad_norms is None or not bool((step_counts > 0).any()):
             if not getattr(self, "_warned_missing_gradient_accumulation", False):
                 self._logger.warning(
-                    "Gradient accumulation data is unavailable (accumulated_gradient_step_counts or "
-                    "accumulated_mean_2d_gradient_norms is None). This is expected when using a projection "
-                    "method that does not support gradient accumulation (e.g., Unscented Transform for "
-                    "OpenCV camera models). Skipping Gaussian insertion for this refinement step."
+                    "No 2D mean-gradient statistics were accumulated since the last refinement. The projection "
+                    "method in use does not produce them (the unscented transform, used for OpenCV camera models "
+                    "and by the world-space render backend, has no backward pass). Skipping Gaussian insertion; "
+                    "the screen-space size thresholds for splitting and deletion are inactive as well."
                 )
                 self._warned_missing_gradient_accumulation = True
             device = self._model.means.device

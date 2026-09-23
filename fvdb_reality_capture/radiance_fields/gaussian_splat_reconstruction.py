@@ -1433,6 +1433,7 @@ class GaussianSplatReconstruction:
                 )
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
+                summed_crop_loss: torch.Tensor | None = None
                 for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
                     # Actual pixels to compute the loss on, normalized to [0, 1]
                     pixels: torch.Tensor = pixels.to(device=self.device) / 255.0  # [1, H, W, 3]
@@ -1467,19 +1468,26 @@ class GaussianSplatReconstruction:
                             raise NotImplementedError("Sparse depth loss is not implemented for batch_size > 1.")
                         if render_outputs.depth is None:
                             raise RuntimeError("Model did not render depth channel, but sparse depth loss is enabled.")
-                        if sparse_depth_uv.numel() == 0:
+                        # The depth points are in full-image pixels while the render covers this crop, so
+                        # keep the points inside the crop and index them in crop coordinates.
+                        crop_x, crop_y, crop_w, crop_h = crop
+                        u = sparse_depth_uv[0, :, 0].long() - crop_x
+                        v = sparse_depth_uv[0, :, 1].long() - crop_y
+                        in_crop = (u >= 0) & (u < crop_w) & (v >= 0) & (v < crop_h)
+                        if not bool(in_crop.any()):
                             depth_loss = 0.0
                         else:
-                            depth = render_outputs.depth[..., 0]  # [1, H, W]
-                            depth_uv = depth[:, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0]]  # [B, N]
-                            alpha_uv = render_outputs.alpha[
-                                :, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0], 0
-                            ]  # [B, N]
+                            u, v = u[in_crop], v[in_crop]
+                            depth = render_outputs.depth[..., 0]  # [1, h, w]
+                            depth_uv = depth[:, v, u]  # [B, N]
+                            alpha_uv = render_outputs.alpha[:, v, u, 0]  # [B, N]
                             pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6)  # [B, N]
-                            pred_depth = pred_depth / median_depths.unsqueeze(1)  # Normalize by median depth
-                            sparse_depth = sparse_depth / median_depths.unsqueeze(1)  # Normalize by median depth
+                            # Normalize prediction and target by the median depth. The target is a fresh view
+                            # per crop; the loop variable itself stays unnormalized for the next crop.
+                            pred_depth = pred_depth / median_depths.unsqueeze(1)
+                            target_depth = sparse_depth[:, in_crop] / median_depths.unsqueeze(1)
 
-                            depth_loss = nnf.l1_loss(pred_depth, sparse_depth) * self.config.sparse_depth_reg
+                            depth_loss = nnf.l1_loss(pred_depth, target_depth) * self.config.sparse_depth_reg
                             loss = loss + depth_loss
                     else:
                         depth_loss = 0.0
@@ -1526,9 +1534,16 @@ class GaussianSplatReconstruction:
                     else:
                         pose_reg = None
 
-                    # If we're splitting into crops, accumulate gradients, so pass retain_graph=True
-                    # for every crop but the last one
-                    loss.backward(retain_graph=not is_last)
+                    if training_view.backward_per_crop:
+                        # Each crop was rasterized on its own, so run its backward now and free its raster
+                        # buffers before the next crop. The shared projection graph is retained until the last.
+                        loss.backward(retain_graph=not is_last)
+                    else:
+                        # Every crop is a slice of one render. Sum the losses and run that render's backward
+                        # once, instead of a full-image backward per crop.
+                        summed_crop_loss = loss if summed_crop_loss is None else summed_crop_loss + loss
+                if summed_crop_loss is not None:
+                    summed_crop_loss.backward()
 
                 # Refine the gaussians via splitting/duplication/pruning
                 if (

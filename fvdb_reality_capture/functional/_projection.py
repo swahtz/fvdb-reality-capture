@@ -14,21 +14,28 @@ from ..enums import CameraModel, ProjectionMethod
 from ._autograd import _ProjectGaussiansFn
 from ._types import ProjectedGaussians
 
-_OPENCV_MODELS = frozenset(
-    {
-        CameraModel.OPENCV_RADTAN_5,
-        CameraModel.OPENCV_RATIONAL_8,
-        CameraModel.OPENCV_RADTAN_THIN_PRISM_9,
-        CameraModel.OPENCV_THIN_PRISM_12,
-    }
-)
+
+def requires_distortion_coeffs(camera_model: CameraModel) -> bool:
+    """Whether a camera model is a lens-distortion model.
+
+    Every model other than pinhole and orthographic distorts, needs distortion coefficients, and can
+    only be projected with the unscented transform. Keeping this the single test means a distortion
+    model added to fvdb is handled consistently by projection, rasterization and the training backends.
+
+    Args:
+        camera_model (CameraModel): The camera model.
+
+    Returns:
+        distorted (bool): ``True`` for the distortion models, ``False`` for pinhole and orthographic.
+    """
+    return CameraModel(camera_model) not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC)
 
 
 def resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
     """Replace :attr:`~fvdb_reality_capture.ProjectionMethod.AUTO` with the concrete method for a camera model.
 
-    Pinhole and orthographic cameras default to the analytic projection; the OpenCV distortion models
-    default to the unscented transform, which is the only method that supports them.
+    Pinhole and orthographic cameras default to the analytic projection; the distortion models default
+    to the unscented transform, which is the only method that supports them.
 
     Args:
         camera_model (CameraModel): The camera model.
@@ -39,9 +46,9 @@ def resolve_projection_method(camera_model: CameraModel, projection_method: Proj
     """
     if projection_method != ProjectionMethod.AUTO:
         return ProjectionMethod(projection_method)
-    if camera_model in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
-        return ProjectionMethod.ANALYTIC
-    return ProjectionMethod.UNSCENTED
+    if requires_distortion_coeffs(camera_model):
+        return ProjectionMethod.UNSCENTED
+    return ProjectionMethod.ANALYTIC
 
 
 def project_gaussians(
@@ -112,7 +119,7 @@ def project_gaussians(
             raise RuntimeError("distortionCoeffs must be contiguous")
 
     resolved = resolve_projection_method(camera_model, projection_method)
-    if camera_model in _OPENCV_MODELS:
+    if requires_distortion_coeffs(camera_model):
         if resolved != ProjectionMethod.UNSCENTED:
             raise RuntimeError("OpenCV camera models require ProjectionMethod::UNSCENTED or AUTO")
         if distortion_coeffs is None:
@@ -138,6 +145,8 @@ def project_gaussians(
             min_radius_2d,
             antialias,
         )
+        if not antialias:
+            compensations = None
     else:
         result = cast(
             tuple[torch.Tensor, ...],
@@ -168,7 +177,7 @@ def project_gaussians(
         means2d=means2d,
         depths=depths,
         conics=conics,
-        compensations=compensations if antialias else None,
+        compensations=compensations,
         image_width=image_width,
         image_height=image_height,
         camera_model=camera_model,

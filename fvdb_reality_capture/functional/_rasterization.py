@@ -11,13 +11,14 @@ import torch
 import torch.nn.functional as nnf
 from fvdb import JaggedTensor
 
-from ..enums import CameraModel, RollingShutterType
+from ..enums import RollingShutterType
 from ._autograd import (
     _RasterizeScreenSpaceGaussiansFn,
     _RasterizeScreenSpaceGaussiansSparseFn,
     _RasterizeWorldSpaceGaussiansFn,
 )
 from ._opacity import check_opacities
+from ._projection import requires_distortion_coeffs
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 Crop = tuple[int, int, int, int]
@@ -251,7 +252,7 @@ def rasterize_world_space_gaussians(
     """
     opacities = check_opacities(opacities, projected)
     if distortion_coeffs is None:
-        if projected.camera_model not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
+        if requires_distortion_coeffs(projected.camera_model):
             raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
         distortion_coeffs = torch.zeros(
             projected.num_cameras, 12, device=world_to_camera_matrices.device, dtype=world_to_camera_matrices.dtype

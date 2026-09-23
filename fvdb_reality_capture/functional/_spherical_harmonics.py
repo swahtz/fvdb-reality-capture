@@ -39,7 +39,10 @@ def evaluate_gaussian_sh(
     """Evaluate spherical harmonics into the per-camera, per-Gaussian features to rasterize.
 
     Gaussians culled by the projection (zero radii) receive zero features. Differentiable with
-    respect to ``sh0``, ``shN``, ``means`` and ``world_to_camera_matrices``.
+    respect to ``sh0``, ``shN``, ``means`` and ``world_to_camera_matrices``. The depth channel is the
+    view-space depth of each Gaussian center. The analytic projection provides it with a gradient; the
+    unscented projection is forward-only, so when a gradient is wanted the depth is recomputed here from
+    ``means`` and ``world_to_camera_matrices``, which is exact because depth is linear in the center.
 
     Args:
         means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
@@ -54,7 +57,17 @@ def evaluate_gaussian_sh(
         features (torch.Tensor): ``[C, N, D]``, ``[C, N, 1]`` or ``[C, N, D + 1]`` depending on ``render_mode``.
     """
     render_mode = GaussianRenderMode(render_mode)
-    depths = projected.depths.unsqueeze(-1)
+    depths = projected.depths
+    if (
+        render_mode != GaussianRenderMode.FEATURES
+        and not projected.is_differentiable
+        and torch.is_grad_enabled()
+        and (means.requires_grad or world_to_camera_matrices.requires_grad)
+    ):
+        rotation_z = world_to_camera_matrices[:, 2, :3]  # [C, 3]
+        translation_z = world_to_camera_matrices[:, 2, 3:4]  # [C, 1]
+        depths = torch.einsum("cj,nj->cn", rotation_z, means) + translation_z
+    depths = depths.unsqueeze(-1)
     if render_mode == GaussianRenderMode.DEPTH:
         return depths
 

@@ -72,6 +72,8 @@ Stage 1: Projection
 
 .. autofunction:: resolve_projection_method
 
+.. autofunction:: requires_distortion_coeffs
+
 
 Stage 2: Features
 -----------------

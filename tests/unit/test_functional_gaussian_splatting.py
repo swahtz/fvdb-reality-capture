@@ -211,6 +211,34 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         torch.testing.assert_close(images.detach(), images_oo, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(alphas.detach(), alphas_oo, atol=1e-5, rtol=1e-5)
 
+    def test_depth_is_differentiable_through_the_unscented_projection(self):
+        means, quats, log_scales, logit_opacities, sh0, shN = self._params(requires_grad=True)
+        analytic = F.project_gaussians(
+            means.detach(), quats.detach(), log_scales.detach(), self.w2c, self.K, self.W, self.H
+        )
+        projected = F.project_gaussians(
+            means, quats, log_scales, self.w2c, self.K, self.W, self.H, projection_method=ProjectionMethod.UNSCENTED
+        )
+        self.assertFalse(projected.depths.requires_grad)
+        # Depth is linear in the center, so the recomputed depth matches the projection's exactly and
+        # carries the gradient the unscented kernel cannot provide.
+        depth = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected, render_mode=GaussianRenderMode.DEPTH)
+        self.assertTrue(depth.requires_grad)
+        visible = analytic.radii.amin(-1) > 0
+        torch.testing.assert_close(depth[..., 0][visible], analytic.depths[visible], atol=1e-4, rtol=1e-4)
+        depth.sum().backward()
+        self.assertGreater(float(means.grad.abs().max()), 0.0)
+        both = F.evaluate_gaussian_sh(
+            means, sh0, shN, self.w2c, projected, render_mode=GaussianRenderMode.FEATURES_AND_DEPTH
+        )
+        self.assertTrue(both[..., 3:].requires_grad)
+        # Without a graph wanted, the projection's own depths are used unchanged.
+        with torch.no_grad():
+            same = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected, render_mode=GaussianRenderMode.DEPTH)
+        self.assertTrue(torch.equal(same[..., 0], projected.depths))
+        self.assertFalse(F.requires_distortion_coeffs(CameraModel.PINHOLE))
+        self.assertTrue(F.requires_distortion_coeffs(CameraModel.OPENCV_RADTAN_5))
+
     def test_training_loop_reduces_loss(self):
         target, _ = self._render_functional(self._params())
         params = self._params(requires_grad=True)
@@ -552,14 +580,17 @@ class TestRenderBackends(FunctionalPipelineTestCase):
             view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
             self._assert_crops_are_slices(view)
         self.assertEqual(project.call_count, 1)
-        # The tile intersection is shared across the crops too.
+        # The tile intersection is shared across the crops too, and each crop runs its own backward.
         pg = view.projected_gaussians
         self.assertIs(pg.tile_intersection(16), pg.tile_intersection(16))
+        self.assertTrue(view.backward_per_crop)
 
     def test_world_space_view_slices_one_render(self):
         model = self._model(self._params())
         view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
         self._assert_crops_are_slices(view)
+        # One render serves every crop, so the loop sums the crop losses and runs backward once.
+        self.assertFalse(view.backward_per_crop)
 
     def test_image_space_backend_rejects_forward_only_projections_for_training(self):
         model = self._model(self._params())

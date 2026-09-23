@@ -27,7 +27,7 @@ from ._analysis import (
     rasterize_num_contributing_gaussians_sparse,
 )
 from ._opacity import compute_gaussian_opacities
-from ._projection import project_gaussians, resolve_projection_method
+from ._projection import project_gaussians, requires_distortion_coeffs, resolve_projection_method
 from ._rasterization import (
     Crop,
     apply_crop,
@@ -54,6 +54,7 @@ __all__ = [
     # Stage 1: projection
     "project_gaussians",
     "resolve_projection_method",
+    "requires_distortion_coeffs",
     # Stage 2: features
     "evaluate_gaussian_sh",
     "sh_degree_from_coefficients",

@@ -3,12 +3,12 @@
 #
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 import torch
 
 from ..enums import CameraModel, ProjectionMethod
-from ..functional import Crop, apply_crop, resolve_projection_method
+from ..functional import Crop, apply_crop, requires_distortion_coeffs, resolve_projection_method
 
 from .gaussian_splat_dataset import SfmDataset
 from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats
@@ -47,7 +47,14 @@ class TrainingView(Protocol):
     A backend does the work that does not depend on the crop once per view (projection for the
     image-space backend, the full render for the world-space one) and returns one of these, so the
     training loop can render each crop without repeating it.
+
+    ``backward_per_crop`` tells the training loop how to run the backward pass. When each crop is
+    rasterized separately, a backward per crop frees that crop's raster buffers before the next one,
+    which is the point of cropping. When every crop is a slice of one render, a single backward over
+    the summed crop losses runs the render's backward once instead of once per crop.
     """
+
+    backward_per_crop: bool
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
         """
@@ -75,6 +82,7 @@ class _ProjectedTrainingView:
     model: GaussianSplat3d
     projected_gaussians: ProjectedGaussianSplats
     tile_size: int
+    backward_per_crop: ClassVar[bool] = True
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
         crop_origin_w, crop_origin_h, crop_w, crop_h = crop
@@ -96,6 +104,7 @@ class _RenderedTrainingView:
     rendered: torch.Tensor
     alpha: torch.Tensor
     num_channels: int
+    backward_per_crop: ClassVar[bool] = False
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
         rendered, alpha = apply_crop(self.rendered, self.alpha, crop)
@@ -127,6 +136,15 @@ def _forward_only_camera_models(dataset: SfmDataset, config: "GaussianSplatRecon
     ]
 
 
+def _forward_only_explanation(forward_only: list[CameraModel], config: "GaussianSplatReconstructionConfig") -> str:
+    names = ", ".join(camera_model.name for camera_model in forward_only)
+    return (
+        f"Camera models {names} resolve to the unscented projection under "
+        f"projection_method={config.projection_method!r}, which has no backward pass, so the image-space render "
+        "backend cannot train them."
+    )
+
+
 def resolve_training_backend(
     backend: "RenderBackend",
     dataset: SfmDataset,
@@ -137,22 +155,21 @@ def resolve_training_backend(
 
     The image-space backend cannot train cameras that need the unscented projection, since that
     projection is forward-only. Rather than fail, such scenes are rendered through the world-space
-    backend, which differentiates through the cameras directly. The switch is logged once. The
+    backend, which differentiates through the 3D parameters directly; the depth channel is recomputed
+    from the Gaussian centers so depth supervision reaches them too. The switch is logged once. The
     2D-gradient statistics that drive Gaussian densification are only accumulated by the analytic
-    projection, so refinement skips insertion on these scenes; the optimizer reports that when it
-    first happens.
+    projection, so refinement does not insert Gaussians on these scenes; the optimizer logs that at
+    its first refinement.
     """
     if not isinstance(backend, ImageSpaceRenderBackend):
         return backend
     forward_only = _forward_only_camera_models(dataset, config)
     if not forward_only:
         return backend
-    names = ", ".join(camera_model.name for camera_model in forward_only)
     logger.warning(
-        f"Camera models {names} use the unscented projection under projection_method={config.projection_method!r}, "
-        "which has no backward pass, so the image-space render backend cannot train them. Rendering through the "
-        "world-space backend instead. Gaussian densification statistics are not accumulated on this path, so "
-        "refinement will not insert new Gaussians. Undistort the images to train with the image-space backend."
+        _forward_only_explanation(forward_only, config) + " Rendering through the world-space backend instead. "
+        "Gaussian densification statistics are not accumulated on this path, so refinement will not insert new "
+        "Gaussians. Undistort the images to train with the image-space backend."
     )
     return WorldSpaceRenderBackend()
 
@@ -167,7 +184,7 @@ def _camera_model_from_batch(camera_models: torch.Tensor) -> CameraModel:
 def _distortion_coeffs_for_batch(
     camera_model: CameraModel, distortion_coeffs: torch.Tensor, device: torch.device
 ) -> torch.Tensor | None:
-    if camera_model in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
+    if not requires_distortion_coeffs(camera_model):
         return None
     return distortion_coeffs.to(device)
 
@@ -300,12 +317,9 @@ class ImageSpaceRenderBackend:
             raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
         forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
-            names = ", ".join(camera_model.name for camera_model in forward_only)
             raise ValueError(
-                f"The image-space render backend cannot train {names} cameras with the "
-                f"{config.projection_method!r} projection method: the unscented projection is forward-only, so "
-                'the Gaussian geometry would receive no gradient. Use render_backend="world_space", which '
-                "differentiates through these cameras directly."
+                _forward_only_explanation(forward_only, config)
+                + ' Use render_backend="world_space", which differentiates through the 3D parameters directly.'
             )
         self._probe(model, dataset, config, device, render_depth=_needs_depth_render(config))
 
