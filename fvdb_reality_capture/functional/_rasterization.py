@@ -70,6 +70,9 @@ def _render_masks(
     """
     tile_size = tiles.tile_size
     if masks is not None:
+        expected = (num_cameras, tiles.image_height, tiles.image_width)
+        if tuple(masks.shape) != expected:
+            raise ValueError(f"masks must be a full-image [C, H, W] mask of shape {expected}, got {tuple(masks.shape)}")
         masks = masks.bool()
     if crop is None:
         tile_masks = pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else None
@@ -86,7 +89,19 @@ def _render_masks(
     return (origin_w, origin_h, width, height), masks, pixel_mask_to_tile_mask(masks, tile_size) & tile_window
 
 
-def _apply_crop(images: torch.Tensor, alphas: torch.Tensor, crop: Crop | None) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_crop(images: torch.Tensor, alphas: torch.Tensor, crop: Crop | None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice rendered images and alphas to a crop window.
+
+    Args:
+        images (torch.Tensor): Rendered images, ``[C, H, W, D]``.
+        alphas (torch.Tensor): Rendered alphas, ``[C, H, W, 1]``.
+        crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window, already
+            validated against the image; ``None`` returns the inputs unchanged.
+
+    Returns:
+        images (torch.Tensor): The window of ``images``, ``[C, height, width, D]``.
+        alphas (torch.Tensor): The window of ``alphas``, ``[C, height, width, 1]``.
+    """
     if crop is None:
         return images, alphas
     origin_w, origin_h, width, height = crop
@@ -187,7 +202,7 @@ def rasterize_screen_space_gaussians(
         ),
     )
     # Slice first so the pixel-mask pass costs the crop, not the full image.
-    images, alphas = _apply_crop(images, alphas, crop)
+    images, alphas = apply_crop(images, alphas, crop)
     if masks is not None:
         images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
     return images, alphas
@@ -268,7 +283,7 @@ def rasterize_world_space_gaussians(
         ),
     )
     # Slice first so the pixel-mask pass costs the crop, not the full image.
-    images, alphas = _apply_crop(images, alphas, crop)
+    images, alphas = apply_crop(images, alphas, crop)
     if masks is not None:
         images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
     return images, alphas

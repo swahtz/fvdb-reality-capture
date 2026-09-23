@@ -29,6 +29,8 @@ from ._analysis import (
 from ._opacity import compute_gaussian_opacities
 from ._projection import project_gaussians, resolve_projection_method
 from ._rasterization import (
+    Crop,
+    apply_crop,
     pixel_mask_to_tile_mask,
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
@@ -66,7 +68,9 @@ __all__ = [
     "rasterize_screen_space_gaussians_sparse",
     "compute_gaussian_opacities",
     "pixel_mask_to_tile_mask",
+    "Crop",
     "validate_crop",
+    "apply_crop",
     # Analysis
     "rasterize_num_contributing_gaussians",
     "rasterize_num_contributing_gaussians_sparse",

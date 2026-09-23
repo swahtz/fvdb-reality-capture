@@ -1,13 +1,14 @@
 # Copyright Contributors to the OpenVDB Project
 # SPDX-License-Identifier: Apache-2.0
 #
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
 import torch
 
 from ..enums import CameraModel, ProjectionMethod
-from ..functional._projection import resolve_projection_method
+from ..functional import Crop, apply_crop, resolve_projection_method
 
 from .gaussian_splat_dataset import SfmDataset
 from .gaussian_splatting import GaussianSplat3d, ProjectedGaussianSplats
@@ -37,8 +38,6 @@ class RenderOutputs:
 
 
 RenderBackendName = Literal["image_space", "world_space"]
-
-Crop = tuple[int, int, int, int]
 
 
 class TrainingView(Protocol):
@@ -99,9 +98,7 @@ class _RenderedTrainingView:
     num_channels: int
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
-        crop_origin_w, crop_origin_h, crop_w, crop_h = crop
-        rendered = self.rendered[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
-        alpha = self.alpha[:, crop_origin_h : crop_origin_h + crop_h, crop_origin_w : crop_origin_w + crop_w]
+        rendered, alpha = apply_crop(self.rendered, self.alpha, crop)
         return _split_render_outputs(rendered, alpha, self.num_channels)
 
 
@@ -114,6 +111,50 @@ def projection_method_from_config(value: str) -> ProjectionMethod:
     if value not in mapping:
         raise ValueError(f"Unsupported projection_method {value}")
     return mapping[value]
+
+
+def _forward_only_camera_models(dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> list[CameraModel]:
+    """Camera models in ``dataset`` that resolve to the unscented projection under ``config``.
+
+    That projection has no backward pass, so rasterizing from it in image space gives the Gaussian
+    geometry no gradient.
+    """
+    projection_method = projection_method_from_config(config.projection_method)
+    return [
+        CameraModel(int(camera_model))
+        for camera_model in torch.unique(torch.from_numpy(dataset.camera_models)).tolist()
+        if resolve_projection_method(CameraModel(int(camera_model)), projection_method) == ProjectionMethod.UNSCENTED
+    ]
+
+
+def resolve_training_backend(
+    backend: "RenderBackend",
+    dataset: SfmDataset,
+    config: "GaussianSplatReconstructionConfig",
+    logger: logging.Logger,
+) -> "RenderBackend":
+    """Return a backend that can train the cameras in ``dataset``, swapping image space for world space if needed.
+
+    The image-space backend cannot train cameras that need the unscented projection, since that
+    projection is forward-only. Rather than fail, such scenes are rendered through the world-space
+    backend, which differentiates through the cameras directly. The switch is logged once. The
+    2D-gradient statistics that drive Gaussian densification are only accumulated by the analytic
+    projection, so refinement skips insertion on these scenes; the optimizer reports that when it
+    first happens.
+    """
+    if not isinstance(backend, ImageSpaceRenderBackend):
+        return backend
+    forward_only = _forward_only_camera_models(dataset, config)
+    if not forward_only:
+        return backend
+    names = ", ".join(camera_model.name for camera_model in forward_only)
+    logger.warning(
+        f"Camera models {names} use the unscented projection under projection_method={config.projection_method!r}, "
+        "which has no backward pass, so the image-space render backend cannot train them. Rendering through the "
+        "world-space backend instead. Gaussian densification statistics are not accumulated on this path, so "
+        "refinement will not insert new Gaussians. Undistort the images to train with the image-space backend."
+    )
+    return WorldSpaceRenderBackend()
 
 
 def _camera_model_from_batch(camera_models: torch.Tensor) -> CameraModel:
@@ -246,7 +287,8 @@ class ImageSpaceRenderBackend:
 
         Cameras that resolve to the unscented projection are rejected. That projection is forward-only,
         so rasterizing from it would train features and opacities while the Gaussian geometry received
-        no gradient at all; the world-space backend differentiates through those cameras directly.
+        no gradient at all. :func:`resolve_training_backend` routes such scenes to the world-space
+        backend before this check is reached.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model used for the probe render.
@@ -254,19 +296,17 @@ class ImageSpaceRenderBackend:
             config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
             device (torch.device): Device on which validation probes should run.
         """
-        camera_models = torch.unique(torch.from_numpy(dataset.camera_models))
-        if config.batch_size > 1 and camera_models.numel() > 1:
+        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
             raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
-        projection_method = projection_method_from_config(config.projection_method)
-        for camera_model in camera_models.tolist():
-            camera_model_enum = CameraModel(int(camera_model))
-            if resolve_projection_method(camera_model_enum, projection_method) == ProjectionMethod.UNSCENTED:
-                raise ValueError(
-                    f"The image-space render backend cannot train {camera_model_enum.name} cameras with the "
-                    f"{config.projection_method!r} projection method: the unscented projection is forward-only, so "
-                    "the Gaussian geometry would receive no gradient. "
-                    'Use render_backend="world_space", which differentiates through these cameras directly.'
-                )
+        forward_only = _forward_only_camera_models(dataset, config)
+        if forward_only:
+            names = ", ".join(camera_model.name for camera_model in forward_only)
+            raise ValueError(
+                f"The image-space render backend cannot train {names} cameras with the "
+                f"{config.projection_method!r} projection method: the unscented projection is forward-only, so "
+                'the Gaussian geometry would receive no gradient. Use render_backend="world_space", which '
+                "differentiates through these cameras directly."
+            )
         self._probe(model, dataset, config, device, render_depth=_needs_depth_render(config))
 
     def forward_train(

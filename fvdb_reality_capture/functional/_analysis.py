@@ -143,15 +143,18 @@ def _count_sparse_unique(
     )
 
 
-def _expand_contributions(sparse_tiles: SparseGaussianTileIntersection, per_unique: JaggedTensor) -> JaggedTensor:
-    """Expand a per-unique-pixel contributor list to the requested pixels, repeating duplicates.
+def _expand_contributions(
+    sparse_tiles: SparseGaussianTileIntersection, ids: JaggedTensor, weights: JaggedTensor
+) -> tuple[JaggedTensor, JaggedTensor]:
+    """Expand per-unique-pixel contributor lists to the requested pixels, repeating duplicates.
 
-    The result nests cameras, then requested pixels, then contributors, so it has the same list
-    structure the dense kernel returns.
+    ``ids`` and ``weights`` list the same contributors, so one gather plan (built with a single
+    device-to-host sync for the total count) serves both. The results nest cameras, then requested
+    pixels, then contributors, the list structure the dense kernel returns.
     """
-    device = per_unique.jdata.device
+    device = ids.jdata.device
     inverse = sparse_tiles.inverse_indices
-    offsets_unique = per_unique.joffsets.to(device)
+    offsets_unique = ids.joffsets.to(device)
     starts = offsets_unique[inverse]
     counts = offsets_unique[1:][inverse] - starts
     offsets = torch.zeros(counts.numel() + 1, dtype=torch.long, device=device)
@@ -166,7 +169,10 @@ def _expand_contributions(sparse_tiles: SparseGaussianTileIntersection, per_uniq
     camera = torch.repeat_interleave(torch.arange(pixels_per_camera.numel(), device=device), pixels_per_camera)
     within_camera = torch.arange(camera.numel(), device=device) - requested_offsets[camera]
     list_ids = torch.stack([camera, within_camera], dim=1).to(torch.int32)
-    return JaggedTensor.from_data_offsets_and_list_ids(per_unique.jdata.index_select(0, gather), offsets, list_ids)
+    return (
+        JaggedTensor.from_data_offsets_and_list_ids(ids.jdata.index_select(0, gather), offsets, list_ids),
+        JaggedTensor.from_data_offsets_and_list_ids(weights.jdata.index_select(0, gather), offsets, list_ids),
+    )
 
 
 def rasterize_contributing_gaussian_ids_sparse(
@@ -215,6 +221,5 @@ def rasterize_contributing_gaussian_ids_sparse(
             num_contributing,
         )
         if sparse_tiles.has_duplicates:
-            ids = _expand_contributions(sparse_tiles, ids)
-            weights = _expand_contributions(sparse_tiles, weights)
+            ids, weights = _expand_contributions(sparse_tiles, ids, weights)
     return ids, weights

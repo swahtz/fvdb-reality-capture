@@ -88,7 +88,9 @@ class ProjectedGaussianSplats:
         self._far_plane = far_plane
         self._min_radius_2d = min_radius_2d
         self._sh_degree_to_use = sh_degree_to_use
-        self._opacities: torch.Tensor | None = None
+        # Computed here, alongside the features, so the projection is a consistent snapshot of the model.
+        # Deriving them at render time would mix the logits as they are then with the geometry as it was.
+        self._opacities = compute_gaussian_opacities(logit_opacities, projected)
         self._tiles: dict[int, GaussianTileIntersection] = {}
 
     @property
@@ -246,21 +248,14 @@ class ProjectedGaussianSplats:
         """
         Return the opacities of each projected Gaussian in each image plane.
 
+        They are computed when the Gaussians are projected, together with the features, so they reflect
+        the model at that moment and carry a gradient exactly when the projection was made with one.
+
         Returns:
             opacities (torch.Tensor): A tensor of shape ``(C, N)`` representing the opacity of each projected Gaussian, where
                 ``C`` is the number of image planes, and ``N`` is the number of projected Gaussians.
         """
-        opacities = self._opacities
-        compensations = self._projected.compensations
-        wants_graph = torch.is_grad_enabled() and (
-            self._logit_opacities.requires_grad or (compensations is not None and compensations.requires_grad)
-        )
-        # A copy cached under no_grad (a preview render, say) carries no graph. Recompute rather than
-        # hand it to a training render, which would silently drop the opacity gradient.
-        if opacities is None or (wants_graph and not opacities.requires_grad):
-            opacities = compute_gaussian_opacities(self._logit_opacities, self._projected)
-            self._opacities = opacities
-        return opacities
+        return self._opacities
 
     @property
     def camera_model(self) -> CameraModel:
@@ -2113,10 +2108,19 @@ class GaussianSplat3d:
         full_masks = masks
         if is_crop:
             # Rejects crops outside the image; clips the size at the image edge.
+            requested_h, requested_w = crop_h, crop_w
             crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
             origin_w, origin_h, crop_w, crop_h = crop
             if masks is not None:
-                # The mask is given in crop coordinates; embed its clipped region in the full image.
+                # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
+                # else (a full-image mask, say) would silently be read from its top-left corner.
+                mask_shape = tuple(masks.shape[-2:])
+                if mask_shape not in ((requested_h, requested_w), (crop_h, crop_w)):
+                    raise ValueError(
+                        f"masks must match the crop, {(requested_h, requested_w)} or its clipped size {(crop_h, crop_w)}, "
+                        f"got {mask_shape}"
+                    )
+                # Embed its clipped region in the full image.
                 full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
                 full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
                     :, :crop_h, :crop_w

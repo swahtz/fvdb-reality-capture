@@ -106,6 +106,8 @@ Stage 4: Rasterization
 
 .. autofunction:: validate_crop
 
+.. autofunction:: apply_crop
+
 .. autofunction:: pixel_mask_to_tile_mask
 
 

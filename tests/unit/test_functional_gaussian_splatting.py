@@ -7,6 +7,7 @@ The pipeline is checked against :class:`GaussianSplat3d`, which composes the sam
 against itself across the dense, sparse, cropped and world-space paths.
 """
 
+import logging
 import unittest
 from unittest import mock
 
@@ -17,7 +18,11 @@ from fvdb.utils.tests import get_fvdb_test_data_path
 
 import fvdb_reality_capture.functional as F
 from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3d, ProjectionMethod
-from fvdb_reality_capture.radiance_fields._gaussian_rendering import ImageSpaceRenderBackend, WorldSpaceRenderBackend
+from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
+    ImageSpaceRenderBackend,
+    WorldSpaceRenderBackend,
+    resolve_training_backend,
+)
 from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import GaussianSplatReconstructionConfig
 
@@ -336,6 +341,14 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             projected, features, opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
         )
         torch.testing.assert_close(with_float, crop, atol=1e-5, rtol=1e-5)
+        # A mask of the wrong size is rejected rather than read from its top-left corner: the stage
+        # function wants a full-image mask, the class method a crop-sized one.
+        with self.assertRaisesRegex(ValueError, "full-image"):
+            F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, masks=mask, crop=(ox, oy, w, h))
+        with self.assertRaisesRegex(ValueError, "match the crop"):
+            model.render_from_projected_gaussians(
+                pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=float_mask
+            )
 
     def test_analysis_matches_oo(self):
         params = self._params()
@@ -424,16 +437,24 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         c, _ = F.rasterize_screen_space_gaussians(projected, features, expanded, tiles)
         torch.testing.assert_close(c, a)
 
-    def test_projected_splats_opacities_recompute_when_a_graph_is_wanted(self):
+    def test_projected_splats_snapshot_opacities_at_projection(self):
         model = self._model(self._params(requires_grad=True))
         pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
-        self.assertTrue(pg.logit_opacities.requires_grad)
+        # Opacities and features come from the same projection, so they carry a gradient together.
+        self.assertTrue(pg.opacities.requires_grad)
+        self.assertTrue(pg.render_quantities.requires_grad)
+        expected = torch.sigmoid(model.logit_opacities.detach()).repeat(self.C, 1)
+        torch.testing.assert_close(pg.opacities.detach(), expected)
+        # An optimizer step between projection and render must not leak into the projection.
         with torch.no_grad():
-            preview = pg.opacities  # e.g. a preview render before training
-        self.assertFalse(preview.requires_grad)
-        trained = pg.opacities
-        self.assertTrue(trained.requires_grad, "a no_grad cache must not feed a training render")
-        self.assertIs(pg.opacities, trained)
+            model.logit_opacities.add_(1.0)
+        torch.testing.assert_close(pg.opacities.detach(), expected)
+        self.assertIs(pg.opacities, pg.opacities)
+        # A projection made without a graph renders without one, for both quantities.
+        with torch.no_grad():
+            preview = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        self.assertFalse(preview.opacities.requires_grad)
+        self.assertFalse(preview.render_quantities.requires_grad)
 
     def test_deduplicate_pixels_keeps_request_order_and_never_merges_out_of_image_pixels(self):
         w, h = 64, 48
@@ -555,6 +576,25 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]))
         pinhole.__len__.return_value = 0
         backend.validate_scene_cameras(model, pinhole, GaussianSplatReconstructionConfig(), self.device)
+
+    def test_training_backend_falls_back_to_world_space_for_forward_only_projections(self):
+        logger = logging.getLogger("test_training_backend_fallback")
+        image_space = ImageSpaceRenderBackend()
+        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]))
+        with self.assertLogs(logger, level="WARNING") as logs:
+            resolved = resolve_training_backend(image_space, opencv, GaussianSplatReconstructionConfig(), logger)
+        self.assertIsInstance(resolved, WorldSpaceRenderBackend)
+        self.assertIn("OPENCV_RADTAN_5", logs.output[0])
+        self.assertIn("densification", logs.output[0].lower())
+        # Analytic scenes keep the requested backend, and world space is never second-guessed.
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]))
+        self.assertIs(
+            resolve_training_backend(image_space, pinhole, GaussianSplatReconstructionConfig(), logger), image_space
+        )
+        world_space = WorldSpaceRenderBackend()
+        self.assertIs(
+            resolve_training_backend(world_space, opencv, GaussianSplatReconstructionConfig(), logger), world_space
+        )
 
 
 if __name__ == "__main__":

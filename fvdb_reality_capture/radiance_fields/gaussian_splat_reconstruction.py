@@ -24,7 +24,7 @@ from scipy.spatial import cKDTree  # type: ignore
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import export_splats_to_usd
 
-from ._gaussian_rendering import RenderBackend, make_render_backend
+from ._gaussian_rendering import RenderBackend, make_render_backend, resolve_training_backend
 from ._gaussian_splat_viz import gaussian_splat_to_view_data
 from ._private.lpips import LPIPSLoss
 from ._private.utils import crop_image_batch
@@ -566,8 +566,8 @@ class GaussianSplatReconstruction:
         model = GaussianSplatReconstruction._init_model(config, optimizer_config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
+        # The constructor resolves the backend against the scene's cameras and validates it.
         render_backend = make_render_backend(config.render_backend)
-        render_backend.validate_scene_cameras(model, train_dataset, config, torch.device(device))
 
         # Initialize optimizer
         max_steps = config.max_epochs * len(train_dataset)
@@ -871,6 +871,9 @@ class GaussianSplatReconstruction:
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
         self.device: torch.device = model.device
+        self._render_backend = resolve_training_backend(
+            self._render_backend, self._training_dataset, self._cfg, self._logger
+        )
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
 
         self._global_step: int = 0
