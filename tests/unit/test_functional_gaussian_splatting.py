@@ -19,11 +19,13 @@ import fvdb_reality_capture.functional as F
 from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3d, ProjectionMethod
 from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
     ImageSpaceRenderBackend,
+    RoutedRenderBackend,
     WorldSpaceRenderBackend,
     _ProjectedTrainingView,
     _RenderedTrainingView,
+    make_render_backend,
 )
-from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch
+from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch, crop_loss_weight
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import GaussianSplatReconstructionConfig
 
 
@@ -603,8 +605,10 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         gt = torch.zeros(self.C, self.H, self.W, 3)
         for _, _, crop, _ in crop_image_batch(gt, None, crops):
             out = view.render_crop(crop)
-            # Sums, so the crop losses add up to exactly the full-image loss.
-            (out.image.square().sum() + out.alpha.sum()).backward()
+            # Mean losses per crop, weighted by the crop's share of the image as the training loop does,
+            # so the crops add up to exactly the full-image mean loss.
+            weight = crop_loss_weight(crop, self.H, self.W)
+            ((out.image.square().mean() + out.alpha.mean()) * weight).backward()
         # Nothing reaches the model until the shared backward runs once.
         self.assertTrue(all(p.grad is None for p in params))
         view.finish_backward()
@@ -653,7 +657,8 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         params = self._params(requires_grad=True)
         model = self._model(params)
         model.accumulate_mean_2d_gradients = True
-        backend = ImageSpaceRenderBackend()
+        backend = make_render_backend("image_space")
+        self.assertIsInstance(backend, RoutedRenderBackend)
         config = GaussianSplatReconstructionConfig()
         full = (0, 0, self.W, self.H)
 
@@ -672,24 +677,83 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         self.assertFalse(torch.equal(params[0].grad, means_grad_after_pinhole), "world space trained the geometry")
         torch.testing.assert_close(model.accumulated_mean_2d_gradient_norms, norms_after_pinhole)
 
-    def test_image_space_validation_reports_forward_only_cameras_and_probes_their_path(self):
+    def test_routed_validation_reports_forward_only_cameras_and_pure_image_space_rejects_them(self):
         model = self._model(self._params())
-        backend = ImageSpaceRenderBackend()
+        routed = make_render_backend("image_space")
+        pure = ImageSpaceRenderBackend()
         module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
+        config = GaussianSplatReconstructionConfig()
         opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
         with self.assertLogs(module_logger, level="WARNING") as logs:
-            backend.validate_scene_cameras(model, opencv, GaussianSplatReconstructionConfig(), self.device)
+            routed.validate_scene_cameras(model, opencv, config, self.device)
         self.assertIn("OPENCV_RADTAN_5", logs.output[0])
-        self.assertIn("world-space", logs.output[0])
+        self.assertIn("world space", logs.output[0])
         self.assertIn("densification", logs.output[0].lower())
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            pure.validate_scene_cameras(model, opencv, config, self.device)
         pinhole_unscented = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        unscented = GaussianSplatReconstructionConfig(projection_method="unscented")
         with self.assertLogs(module_logger, level="WARNING"):
-            backend.validate_scene_cameras(
-                model, pinhole_unscented, GaussianSplatReconstructionConfig(projection_method="unscented"), self.device
-            )
+            routed.validate_scene_cameras(model, pinhole_unscented, unscented, self.device)
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            pure.validate_scene_cameras(model, pinhole_unscented, unscented, self.device)
         pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
         with self.assertNoLogs(module_logger, level="WARNING"):
-            backend.validate_scene_cameras(model, pinhole, GaussianSplatReconstructionConfig(), self.device)
+            routed.validate_scene_cameras(model, pinhole, config, self.device)
+            pure.validate_scene_cameras(model, pinhole, config, self.device)
+
+    def test_routed_evaluation_uses_the_renderer_that_trains_each_camera(self):
+        model = self._model(self._params())
+        routed = make_render_backend("image_space")
+        config = GaussianSplatReconstructionConfig()
+        for camera_model, reference in (
+            (CameraModel.OPENCV_RADTAN_5, WorldSpaceRenderBackend()),
+            (CameraModel.PINHOLE, ImageSpaceRenderBackend()),
+        ):
+            camera_models, distortion_coeffs = self._camera_batch(camera_model)
+            kwargs = dict(
+                model=model,
+                config=config,
+                world_to_camera_matrices=self.w2c,
+                projection_matrices=self.K,
+                camera_models=camera_models,
+                distortion_coeffs=distortion_coeffs,
+                image_width=self.W,
+                image_height=self.H,
+                sh_degree_to_use=self.sh_degree,
+            )
+            routed_eval = routed.forward_eval(**kwargs)
+            reference_eval = reference.forward_eval(**kwargs)
+            torch.testing.assert_close(routed_eval.image, reference_eval.image, atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(routed_eval.alpha, reference_eval.alpha, atol=1e-5, rtol=1e-5)
+
+    def test_stale_tiles_are_rejected_and_precomputed_tiles_are_accepted(self):
+        params = self._params()
+        means, quats, log_scales, logit_opacities, sh0, shN = params
+        projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        # Tiles from a different image size or camera count would index the kernels out of range.
+        smaller = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W // 2, self.H // 2)
+        smaller_opacities = F.compute_gaussian_opacities(logit_opacities, smaller)
+        with self.assertRaisesRegex(ValueError, "intersected for"):
+            F.rasterize_screen_space_gaussians(smaller, features, smaller_opacities, tiles)
+        with self.assertRaisesRegex(ValueError, "intersected for"):
+            F.rasterize_num_contributing_gaussians(smaller, smaller_opacities, tiles)
+        one_camera = F.project_gaussians(means, quats, log_scales, self.w2c[:1], self.K[:1], self.W, self.H)
+        with self.assertRaisesRegex(ValueError, "cameras"):
+            F.rasterize_screen_space_gaussians(
+                one_camera, features[:1], F.compute_gaussian_opacities(logit_opacities, one_camera), tiles
+            )
+        # The class method takes precomputed tiles for repeated crops and renders the same pixels with them.
+        model = self._model(params)
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        pg_tiles = pg.tile_intersection(16)
+        crop = dict(crop_width=40, crop_height=30, crop_origin_w=5, crop_origin_h=7)
+        without, _ = model.render_from_projected_gaussians(pg, **crop)
+        with_tiles, _ = model.render_from_projected_gaussians(pg, tiles=pg_tiles, **crop)
+        torch.testing.assert_close(with_tiles, without)
 
 
 if __name__ == "__main__":

@@ -377,16 +377,9 @@ class ImageSpaceRenderBackend:
     and then rasterizes those projected Gaussians. It is the natural fit for the classic 3DGS
     rendering path and for renderers that need projected-gaussian intermediates during training.
 
-    Training batches whose camera needs the unscented projection are rendered through the
-    world-space path instead. That projection has no backward pass, so rasterizing from it would
-    train features and opacities while the Gaussian geometry received no gradient; the world-space
-    rasterizer differentiates through the 3D parameters directly. The choice is made per batch, so
-    in a scene that mixes pinhole and distortion cameras the pinhole views keep image space and keep
-    feeding the densification statistics, which only the analytic projection's backward produces.
+    It cannot train cameras that need the unscented projection, which has no backward pass;
+    :class:`RoutedRenderBackend` sends those batches to :class:`WorldSpaceRenderBackend` instead.
     """
-
-    def __init__(self) -> None:
-        self._world_space = WorldSpaceRenderBackend()
 
     def validate_scene_cameras(
         self,
@@ -398,9 +391,8 @@ class ImageSpaceRenderBackend:
         """
         Probe the scene cameras to ensure image-space rendering supports them.
 
-        Cameras that resolve to the unscented projection are probed through the world-space path
-        their training batches will take, and their presence is logged once, since views from them
-        contribute no densification statistics.
+        Cameras that resolve to the unscented projection are rejected: rasterizing from that projection
+        would train features and opacities while the Gaussian geometry received no gradient at all.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model used for the probe render.
@@ -410,20 +402,20 @@ class ImageSpaceRenderBackend:
         """
         if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
             raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
-        forward_only = set(_forward_only_camera_models(dataset, config))
+        forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
-            _logger.warning(
-                _forward_only_explanation(sorted(forward_only, key=int), config)
-                + " Views from those cameras are rendered through the world-space path, which differentiates through "
-                "the 3D parameters directly; views from other cameras keep the image-space path. Gaussian densification "
-                "statistics come only from image-space views. Undistort the images to train every view in image space."
+            raise ValueError(
+                _forward_only_explanation(forward_only, config)
+                + ' Use render_backend="world_space", or the routed backend that "image_space" selects, which '
+                "differentiates through the 3D parameters directly for those cameras."
             )
         with torch.no_grad():
             for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
                 dataset, device
             ):
-                probe = _probe_world_space_render if camera_model in forward_only else _probe_projection
-                probe(model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height)
+                _probe_projection(
+                    model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height
+                )
 
     def forward_train(
         self,
@@ -440,10 +432,9 @@ class ImageSpaceRenderBackend:
         """
         Project the Gaussians into the target cameras once; the returned view rasterizes each crop.
 
-        If depth regularization is enabled, the projection also carries the depth channel. Tile
-        intersections and opacities are cached on the projection, so rendering several crops repeats
-        only the rasterization. A batch whose camera resolves to the forward-only unscented projection
-        is handed to the world-space backend instead, so its geometry still receives a gradient.
+        If depth regularization is enabled, the projection also carries the depth channel. The view
+        keeps the tile intersection and the opacities of that projection, so rendering several crops
+        repeats only the rasterization.
 
         Args:
             model (GaussianSplat3d): Gaussian splat model to render.
@@ -461,18 +452,6 @@ class ImageSpaceRenderBackend:
         """
         camera_model = _camera_model_from_batch(camera_models)
         projection_method = projection_method_from_config(config.projection_method)
-        if resolve_projection_method(camera_model, projection_method) == ProjectionMethod.UNSCENTED:
-            return self._world_space.forward_train(
-                model,
-                config,
-                world_to_camera_matrices,
-                projection_matrices,
-                camera_models,
-                distortion_coeffs,
-                image_width,
-                image_height,
-                sh_degree_to_use,
-            )
         distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
         projection_function = (
             model.project_gaussians_for_images_and_depths
@@ -689,9 +668,127 @@ class WorldSpaceRenderBackend:
         return RenderOutputs(image=image, alpha=alpha)
 
 
+class RoutedRenderBackend:
+    """
+    Image space where it can train, world space where it must, chosen per camera batch.
+
+    Batches whose camera has an analytic projection go to :class:`ImageSpaceRenderBackend`. Batches
+    whose camera resolves to the unscented projection, which has no backward pass, go to
+    :class:`WorldSpaceRenderBackend`, which differentiates through the 3D parameters directly. The
+    same choice is made for training and evaluation, so the renderer being measured is the one being
+    optimized. Because it is per batch, a scene that mixes pinhole and distortion cameras keeps its
+    pinhole views in image space, and they keep feeding the densification statistics, which only the
+    analytic projection's backward produces.
+    """
+
+    def __init__(self) -> None:
+        self._image_space = ImageSpaceRenderBackend()
+        self._world_space = WorldSpaceRenderBackend()
+
+    def _backend_for(self, camera_model: CameraModel, config: "GaussianSplatReconstructionConfig") -> RenderBackend:
+        projection_method = projection_method_from_config(config.projection_method)
+        if resolve_projection_method(camera_model, projection_method) == ProjectionMethod.UNSCENTED:
+            return self._world_space
+        return self._image_space
+
+    def validate_scene_cameras(
+        self,
+        model: GaussianSplat3d,
+        dataset: SfmDataset,
+        config: "GaussianSplatReconstructionConfig",
+        device: torch.device,
+    ) -> None:
+        """
+        Probe every camera model in the scene through the path its batches will take.
+
+        Camera models that will render in world space are logged once, since views from them add
+        nothing to the densification statistics.
+
+        Args:
+            model (GaussianSplat3d): Gaussian splat model used for the probe render.
+            dataset (SfmDataset): Dataset whose cameras should be validated.
+            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
+            device (torch.device): Device on which validation probes should run.
+        """
+        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
+            raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+        forward_only = _forward_only_camera_models(dataset, config)
+        if forward_only:
+            _logger.warning(
+                _forward_only_explanation(forward_only, config)
+                + " Views from those cameras are rendered in world space, which differentiates through the 3D "
+                "parameters directly; views from other cameras stay in image space. Gaussian densification "
+                "statistics come only from image-space views. Undistort the images to train every view in image space."
+            )
+        with torch.no_grad():
+            for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
+                dataset, device
+            ):
+                probe = (
+                    _probe_projection
+                    if self._backend_for(camera_model, config) is self._image_space
+                    else _probe_world_space_render
+                )
+                probe(model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height)
+
+    def forward_train(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        camera_models: torch.Tensor,
+        distortion_coeffs: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        sh_degree_to_use: int,
+    ) -> TrainingView:
+        """Do the per-image training work with the backend chosen for this batch's camera; see :class:`RenderBackend`."""
+        return self._backend_for(_camera_model_from_batch(camera_models), config).forward_train(
+            model,
+            config,
+            world_to_camera_matrices,
+            projection_matrices,
+            camera_models,
+            distortion_coeffs,
+            image_width,
+            image_height,
+            sh_degree_to_use,
+        )
+
+    def forward_eval(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        camera_models: torch.Tensor,
+        distortion_coeffs: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        sh_degree_to_use: int,
+    ) -> RenderOutputs:
+        """Render an evaluation image with the backend chosen for this batch's camera; see :class:`RenderBackend`."""
+        return self._backend_for(_camera_model_from_batch(camera_models), config).forward_eval(
+            model,
+            config,
+            world_to_camera_matrices,
+            projection_matrices,
+            camera_models,
+            distortion_coeffs,
+            image_width,
+            image_height,
+            sh_degree_to_use,
+        )
+
+
 def make_render_backend(name: RenderBackendName) -> RenderBackend:
+    """Return the backend a :class:`GaussianSplatReconstructionConfig` ``render_backend`` value names.
+
+    ``"image_space"`` is the routed backend: image space for cameras it can train, world space for the rest.
+    """
     if name == "image_space":
-        return ImageSpaceRenderBackend()
+        return RoutedRenderBackend()
     if name == "world_space":
         return WorldSpaceRenderBackend()
     raise ValueError(f"Unsupported render_backend {name}")

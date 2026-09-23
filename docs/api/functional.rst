@@ -92,8 +92,14 @@ Stage 3: Tile Intersection
 
 .. autofunction:: deduplicate_pixels
 
-``as_pixel_jagged`` is ``fvdb.functional.as_pixel_jagged``, re-exported so the sparse pipeline here
-applies the same pixel-selection checks as fvdb's own sparse kernels.
+.. autofunction:: check_tiles_match
+
+.. py:function:: as_pixel_jagged(pixels_to_render)
+
+   ``fvdb.functional.as_pixel_jagged``, re-exported so the sparse pipeline here applies the same
+   pixel-selection checks as fvdb's own sparse kernels. Normalizes a ``[C, P, 2]`` tensor or a
+   :class:`~fvdb.JaggedTensor` of ``(row, col)`` integer pixels to a JaggedTensor with one list per
+   camera, raising ``TypeError`` for non-integer coordinates and ``ValueError`` for malformed shapes.
 
 
 Stage 4: Rasterization
@@ -106,6 +112,10 @@ Stage 4: Rasterization
 .. autofunction:: rasterize_screen_space_gaussians_sparse
 
 .. autofunction:: compute_gaussian_opacities
+
+.. py:data:: Crop
+
+   ``tuple[int, int, int, int]``: a crop window as ``(origin_w, origin_h, width, height)`` in pixels.
 
 .. autofunction:: validate_crop
 

@@ -19,6 +19,7 @@ from ._autograd import (
 )
 from ._opacity import check_opacities
 from ._projection import requires_distortion_coeffs
+from ._tile_intersection import check_tiles_match
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 Crop = tuple[int, int, int, int]
@@ -58,17 +59,20 @@ def validate_crop(crop: Crop, image_width: int, image_height: int) -> Crop:
 def _render_masks(
     crop: Crop | None,
     masks: torch.Tensor | None,
-    num_cameras: int,
+    projected: ProjectedGaussians,
     tiles: GaussianTileIntersection,
     device: torch.device,
 ) -> tuple[Crop | None, torch.Tensor | None, torch.Tensor | None]:
     """Resolve the crop and masks into what the rasterizer and the post-pass need.
 
-    Returns the clamped crop, the full-image per-pixel mask to apply after rendering and slicing
-    (``None`` when no pixel mask was given, since slicing to the crop already discards out-of-crop
-    pixels), and the per-tile mask that lets the rasterizer skip tiles outside the crop or fully
-    masked out. The tile grid comes from ``tiles`` so it cannot drift from the intersection's.
+    Checks that ``tiles`` belong to ``projected`` first. Returns the clamped crop, the full-image
+    per-pixel mask to apply after rendering and slicing (``None`` when no pixel mask was given, since
+    slicing to the crop already discards out-of-crop pixels), and the per-tile mask that lets the
+    rasterizer skip tiles outside the crop or fully masked out. The tile grid comes from ``tiles`` so
+    it cannot drift from the intersection's.
     """
+    check_tiles_match(tiles, projected)
+    num_cameras = projected.num_cameras
     tile_size = tiles.tile_size
     if masks is not None:
         expected = (num_cameras, tiles.image_height, tiles.image_width)
@@ -219,7 +223,7 @@ def rasterize_screen_space_gaussians(
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
     opacities = check_opacities(opacities, projected)
-    crop, masks, tile_masks = _render_masks(crop, masks, projected.num_cameras, tiles, opacities.device)
+    crop, masks, tile_masks = _render_masks(crop, masks, projected, tiles, opacities.device)
     images, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeScreenSpaceGaussiansFn.apply(
@@ -294,7 +298,7 @@ def rasterize_world_space_gaussians(
         distortion_coeffs = torch.zeros(
             projected.num_cameras, 12, device=world_to_camera_matrices.device, dtype=world_to_camera_matrices.dtype
         )
-    crop, masks, tile_masks = _render_masks(crop, masks, projected.num_cameras, tiles, opacities.device)
+    crop, masks, tile_masks = _render_masks(crop, masks, projected, tiles, opacities.device)
     images, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeWorldSpaceGaussiansFn.apply(
@@ -356,6 +360,7 @@ def rasterize_screen_space_gaussians_sparse(
         alphas (JaggedTensor): Accumulated alpha per requested pixel, one ``[P_c, 1]`` list per camera.
     """
     opacities = check_opacities(opacities, projected)
+    check_tiles_match(sparse_tiles, projected)
     rendered, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeScreenSpaceGaussiansSparseFn.apply(

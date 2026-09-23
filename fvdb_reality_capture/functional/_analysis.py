@@ -10,6 +10,7 @@ from fvdb import JaggedTensor
 from fvdb import functional as F
 
 from ._opacity import check_opacities
+from ._tile_intersection import check_tiles_match
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 
@@ -36,6 +37,7 @@ def rasterize_num_contributing_gaussians(
 def _count_dense(
     projected: ProjectedGaussians, opacities: torch.Tensor, tiles: GaussianTileIntersection
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    check_tiles_match(tiles, projected)
     return F.rasterize_num_contributing_gaussians(
         projected.means2d,
         projected.conics,
@@ -77,6 +79,7 @@ def rasterize_contributing_gaussian_ids(
     """
     with torch.no_grad():
         opacities = check_opacities(opacities, projected)
+        check_tiles_match(tiles, projected)
         if top_k_contributors <= 0 and num_contributing is None:
             num_contributing, _ = _count_dense(projected, opacities, tiles)
         return F.rasterize_contributing_gaussian_ids(
@@ -124,6 +127,7 @@ def _count_sparse_unique(
     projected: ProjectedGaussians, opacities: torch.Tensor, sparse_tiles: SparseGaussianTileIntersection
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """Contributor counts and alphas over the unique pixels, as the kernel produces them."""
+    check_tiles_match(sparse_tiles, projected)
     return F.rasterize_num_contributing_gaussians_sparse(
         projected.means2d,
         projected.conics,
@@ -198,6 +202,7 @@ def rasterize_contributing_gaussian_ids_sparse(
     """
     with torch.no_grad():
         opacities = check_opacities(opacities, projected)
+        check_tiles_match(sparse_tiles, projected)
         num_contributing = None
         if top_k_contributors <= 0:
             num_contributing, _ = _count_sparse_unique(projected, opacities, sparse_tiles)

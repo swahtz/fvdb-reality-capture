@@ -20,6 +20,32 @@ def _tile_grid(image_width: int, image_height: int, tile_size: int) -> tuple[int
     return math.ceil(image_height / tile_size), math.ceil(image_width / tile_size)
 
 
+def check_tiles_match(
+    tiles: GaussianTileIntersection | SparseGaussianTileIntersection, projected: ProjectedGaussians
+) -> None:
+    """Raise if ``tiles`` were not intersected for ``projected``.
+
+    Tile intersections index the kernels by camera and image tile. Stale ones, from a projection of a
+    different camera batch or image size, would read out of range and produce garbage or a device assert
+    rather than a Python error, so the stages check this up front.
+
+    Args:
+        tiles (GaussianTileIntersection | SparseGaussianTileIntersection): The tile intersection to check.
+        projected (ProjectedGaussians): The projection the tiles are about to be rasterized with.
+    """
+    if (tiles.image_width, tiles.image_height) != (projected.image_width, projected.image_height):
+        raise ValueError(
+            f"tiles were intersected for a {tiles.image_width}x{tiles.image_height} image but the projection is "
+            f"{projected.image_width}x{projected.image_height}"
+        )
+    if isinstance(tiles, GaussianTileIntersection):
+        num_cameras = tiles.tile_offsets.shape[0]
+    else:
+        num_cameras = tiles.pixels_to_render.num_tensors
+    if num_cameras != projected.num_cameras:
+        raise ValueError(f"tiles cover {num_cameras} cameras but the projection has {projected.num_cameras}")
+
+
 def _culling_inputs(
     projected: ProjectedGaussians, opacities: torch.Tensor | None
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:

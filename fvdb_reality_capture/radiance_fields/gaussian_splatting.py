@@ -1507,6 +1507,38 @@ class GaussianSplat3d:
             accumulated_max_2d_radii=max_radii,
         )
 
+    def _project_and_opacities(
+        self,
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        near: float,
+        far: float,
+        camera_model: CameraModel,
+        projection_method: ProjectionMethod,
+        distortion_coeffs: torch.Tensor | None,
+        min_radius_2d: float,
+        eps_2d: float,
+        antialias: bool,
+    ) -> tuple[ProjectedGaussians, torch.Tensor]:
+        """Stage 1 plus the per-camera opacities every later stage takes, computed once."""
+        projected = self._project(
+            world_to_camera_matrices,
+            projection_matrices,
+            image_width,
+            image_height,
+            near,
+            far,
+            camera_model,
+            projection_method,
+            distortion_coeffs,
+            min_radius_2d,
+            eps_2d,
+            antialias,
+        )
+        return projected, compute_gaussian_opacities(self._logit_opacities, projected)
+
     def _features(
         self,
         projected: ProjectedGaussians,
@@ -1942,13 +1974,16 @@ class GaussianSplat3d:
             # in each image plane.
             # Returns a tensor of shape [C, 100, 100, D] containing the images (where D is num_channels + 1 for depth),
             # and a tensor of shape [C, 100, 100, 1] containing the final alpha (opacity) values
-            # of each pixel.
+            # of each pixel. Binning the Gaussians into tiles once and passing the result lets several
+            # crops share it.
+            tiles = projected_gaussians.tile_intersection()
             cropped_images_1, cropped_alphas = gaussian_splat_3d.render_from_projected_gaussians(
                 projected_gaussians,
                 crop_width=100,
                 crop_height=100,
                 crop_origin_w=10,
-                crop_origin_h=10)
+                crop_origin_h=10,
+                tiles=tiles)
 
             cropped_images = cropped_images_1[..., :-1]  # Extract image channels
 
@@ -2013,6 +2048,7 @@ class GaussianSplat3d:
         tile_size: int = 16,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
+        tiles: GaussianTileIntersection | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render a set of images from Gaussian splats that have already been projected onto image planes
@@ -2051,13 +2087,16 @@ class GaussianSplat3d:
             # in each image plane.
             # Returns a tensor of shape [C, 100, 100, D] containing the images (where D is num_channels + 1 for depth),
             # and a tensor of shape [C, 100, 100, 1] containing the final alpha (opacity) values
-            # of each pixel.
+            # of each pixel. Binning the Gaussians into tiles once and passing the result lets several
+            # crops share it.
+            tiles = projected_gaussians.tile_intersection()
             cropped_images_1, cropped_alphas = gaussian_splat_3d.render_from_projected_gaussians(
                 projected_gaussians,
                 crop_width=100,
                 crop_height=100,
                 crop_origin_w=10,
-                crop_origin_h=10)
+                crop_origin_h=10,
+                tiles=tiles)
 
             cropped_images = cropped_images_1[..., :-1]  # Extract image channels
 
@@ -2087,6 +2126,10 @@ class GaussianSplat3d:
             masks (torch.Tensor | None): Optional per-pixel boolean mask of shape ``(C, cropH, cropW)``
                 (in crop coordinate space, matching the output dimensions).
                 ``True`` means render, ``False`` means skip (filled with background).
+            tiles (GaussianTileIntersection | None): The tile intersections of ``projected_gaussians`` at
+                ``tile_size``, from :meth:`ProjectedGaussianSplats.tile_intersection`. Computed here when
+                ``None``. Pass them when rendering several crops from one projection, so the Gaussians are
+                binned into tiles once rather than once per crop.
 
 
         Returns:
@@ -2135,7 +2178,7 @@ class GaussianSplat3d:
             projected,
             pg.render_quantities,
             pg.opacities,
-            pg.tile_intersection(tile_size),
+            tiles if tiles is not None else pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
             masks=full_masks,
             crop=crop,
@@ -3073,7 +3116,7 @@ class GaussianSplat3d:
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
         with torch.no_grad():
-            projected = self._project(
+            projected, opacities = self._project_and_opacities(
                 world_to_camera_matrices,
                 projection_matrices,
                 image_width,
@@ -3087,7 +3130,6 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
             return rasterize_num_contributing_gaussians(projected, opacities, tiles)
 
@@ -3195,7 +3237,7 @@ class GaussianSplat3d:
         """
         pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
-            projected = self._project(
+            projected, opacities = self._project_and_opacities(
                 world_to_camera_matrices,
                 projection_matrices,
                 image_width,
@@ -3209,7 +3251,6 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities
             )
@@ -3271,7 +3312,7 @@ class GaussianSplat3d:
                 sum to 1 for each pixel if that pixel is opaque (alpha=1).
         """
         with torch.no_grad():
-            projected = self._project(
+            projected, opacities = self._project_and_opacities(
                 world_to_camera_matrices,
                 projection_matrices,
                 image_width,
@@ -3285,7 +3326,6 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
             return rasterize_contributing_gaussian_ids(projected, opacities, tiles, top_k_contributors)
 
@@ -3392,7 +3432,7 @@ class GaussianSplat3d:
         """
         pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
-            projected = self._project(
+            projected, opacities = self._project_and_opacities(
                 world_to_camera_matrices,
                 projection_matrices,
                 image_width,
@@ -3406,7 +3446,6 @@ class GaussianSplat3d:
                 eps_2d,
                 antialias,
             )
-            opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities
             )

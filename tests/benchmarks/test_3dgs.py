@@ -161,10 +161,8 @@ class Benchmark3dgs:
         )
 
     def run_render_gaussians(self):
-        # Render the full image from the projected Gaussians. Tile intersection is timed as part of
-        # rendering, as it always has been; ProjectedGaussianSplats caches it per projection, which would
-        # otherwise drop it from every iteration after the first and make the numbers incomparable with
-        # earlier runs and with gsplat.
+        # Render the full image from the projected Gaussians through the stage functions, so tile
+        # intersection is timed as part of rendering on every iteration, as it always has been.
         pg = self.projected_gaussians
         tiles = frc_functional.intersect_gaussian_tiles(
             pg.projected_gaussians, pg.opacities, tile_size=self.runner.config.tile_size
