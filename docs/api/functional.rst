@@ -92,7 +92,8 @@ Stage 3: Tile Intersection
 
 .. autofunction:: deduplicate_pixels
 
-.. autofunction:: as_pixel_jagged
+``as_pixel_jagged`` is ``fvdb.functional.as_pixel_jagged``, re-exported so the sparse pipeline here
+applies the same pixel-selection checks as fvdb's own sparse kernels.
 
 
 Stage 4: Rasterization

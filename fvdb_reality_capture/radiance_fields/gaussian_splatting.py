@@ -31,6 +31,7 @@ from ..functional import (
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
     rasterize_world_space_gaussians,
+    sh_degree_from_coefficients,
     validate_crop,
 )
 from ..functional._autograd import (
@@ -936,7 +937,7 @@ class GaussianSplat3d:
         Returns:
             sh_degree (int): The degree of the spherical harmonics.
         """
-        return int(math.isqrt(self._shN.size(1) + 1)) - 1
+        return sh_degree_from_coefficients(self._shN)
 
     @property
     def num_channels(self) -> int:
@@ -2070,7 +2071,8 @@ class GaussianSplat3d:
                 :meth:`project_gaussians_for_images`, :meth:`project_gaussians_for_depths`,
                 :meth:`project_gaussians_for_images_and_depths`, etc.
             crop_width (int): The width of the crop to render. If -1, the full image width is used.
-                Default is -1.
+                Default is -1. A crop that runs past the image edge is filled with the background at zero
+                alpha outside the image, so the output always has the requested size.
             crop_height (int): The height of the crop to render. If -1, the full image height is used.
                 Default is -1.
             crop_origin_w (int): The x-coordinate of the top-left corner of the crop. If -1, the crop starts at (0, 0).
@@ -2106,9 +2108,9 @@ class GaussianSplat3d:
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
         crop = None
         full_masks = masks
+        requested_h, requested_w = crop_h, crop_w
         if is_crop:
             # Rejects crops outside the image; clips the size at the image edge.
-            requested_h, requested_w = crop_h, crop_w
             crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
             origin_w, origin_h, crop_w, crop_h = crop
             if masks is not None:
@@ -2125,7 +2127,7 @@ class GaussianSplat3d:
                 full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
                     :, :crop_h, :crop_w
                 ].bool()
-        return rasterize_screen_space_gaussians(
+        images, alphas = rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
             pg.opacities,
@@ -2134,6 +2136,17 @@ class GaussianSplat3d:
             masks=full_masks,
             crop=crop,
         )
+        if crop is not None and (crop_h, crop_w) != (requested_h, requested_w):
+            # The crop ran past the image edge. Fill the part outside the image with the background at
+            # zero alpha so the output has the requested size, which callers stacking crops rely on.
+            padded = images.new_zeros(images.shape[0], requested_h, requested_w, images.shape[-1])
+            if backgrounds is not None:
+                padded[:] = backgrounds.to(padded)[:, None, None, :]
+            padded[:, :crop_h, :crop_w] = images
+            padded_alphas = alphas.new_zeros(alphas.shape[0], requested_h, requested_w, 1)
+            padded_alphas[:, :crop_h, :crop_w] = alphas
+            return padded, padded_alphas
+        return images, alphas
 
     def render_depths(
         self,

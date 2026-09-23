@@ -24,7 +24,7 @@ from scipy.spatial import cKDTree  # type: ignore
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import export_splats_to_usd
 
-from ._gaussian_rendering import RenderBackend, make_render_backend, resolve_training_backend
+from ._gaussian_rendering import RenderBackend, make_render_backend
 from ._gaussian_splat_viz import gaussian_splat_to_view_data
 from ._private.lpips import LPIPSLoss
 from ._private.utils import crop_image_batch
@@ -566,7 +566,7 @@ class GaussianSplatReconstruction:
         model = GaussianSplatReconstruction._init_model(config, optimizer_config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
-        # The constructor resolves the backend against the scene's cameras and validates it.
+        # The constructor validates the backend against the scene's cameras.
         render_backend = make_render_backend(config.render_backend)
 
         # Initialize optimizer
@@ -871,9 +871,6 @@ class GaussianSplatReconstruction:
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
         self.device: torch.device = model.device
-        self._render_backend = resolve_training_backend(
-            self._render_backend, self._training_dataset, self._cfg, self._logger
-        )
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
 
         self._global_step: int = 0
@@ -1433,8 +1430,7 @@ class GaussianSplatReconstruction:
                 )
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
-                summed_crop_loss: torch.Tensor | None = None
-                for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
+                for pixels, mask_pixels, crop, _ in crop_image_batch(image, mask, self.config.crops_per_image):
                     # Actual pixels to compute the loss on, normalized to [0, 1]
                     pixels: torch.Tensor = pixels.to(device=self.device) / 255.0  # [1, H, W, 3]
 
@@ -1534,16 +1530,14 @@ class GaussianSplatReconstruction:
                     else:
                         pose_reg = None
 
-                    if training_view.backward_per_crop:
-                        # Each crop was rasterized on its own, so run its backward now and free its raster
-                        # buffers before the next crop. The shared projection graph is retained until the last.
-                        loss.backward(retain_graph=not is_last)
-                    else:
-                        # Every crop is a slice of one render. Sum the losses and run that render's backward
-                        # once, instead of a full-image backward per crop.
-                        summed_crop_loss = loss if summed_crop_loss is None else summed_crop_loss + loss
-                if summed_crop_loss is not None:
-                    summed_crop_loss.backward()
+                    # This crop's rasterization and loss graphs end at the view's detached per-view tensors, so
+                    # backward here frees them and accumulates the crop's gradient into those tensors.
+                    loss.backward()
+                # One backward through the shared per-view work (projection and features, or the world-space
+                # render) with the gradient every crop accumulated, so it runs once however many crops there are.
+                training_view.finish_backward()
+                # Release the view and its render before the next step projects, so two never coexist.
+                del training_view, render_outputs
 
                 # Refine the gaussians via splitting/duplication/pruning
                 if (

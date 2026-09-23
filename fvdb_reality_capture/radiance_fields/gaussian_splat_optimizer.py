@@ -855,18 +855,27 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         # We use the average norm of the gradients of the projected Gaussians with respect to the
         # loss (accumulated since the last refinement step) to decide which Gaussians to duplicate or split.
 
-        # Only the analytic projection's backward pass fills the 2D gradient accumulators. With the
-        # unscented transform (OpenCV camera models, or world-space rendering) the model still holds the
-        # tensors, zeroed, so check that something was accumulated rather than that they exist.
+        # Only the analytic projection's backward pass fills the 2D gradient accumulators, and only when
+        # the loss reached the projected means. The model holds the tensors zeroed whenever accumulation
+        # is enabled, and world-space rendering with an analytic projection runs that backward with a zero
+        # 2D-mean gradient (it reaches the projection only through depth or antialiasing compensation),
+        # bumping the step counts. So check that a non-zero gradient was accumulated, not that the
+        # tensors exist or were touched.
         step_counts = self._model.accumulated_gradient_step_counts
         grad_norms = self._model.accumulated_mean_2d_gradient_norms
-        if step_counts is None or grad_norms is None or not bool((step_counts > 0).any()):
+        if (
+            step_counts is None
+            or grad_norms is None
+            or not bool((step_counts > 0).any())
+            or not bool((grad_norms > 0).any())
+        ):
             if not getattr(self, "_warned_missing_gradient_accumulation", False):
                 self._logger.warning(
-                    "No 2D mean-gradient statistics were accumulated since the last refinement. The projection "
-                    "method in use does not produce them (the unscented transform, used for OpenCV camera models "
-                    "and by the world-space render backend, has no backward pass). Skipping Gaussian insertion; "
-                    "the screen-space size thresholds for splitting and deletion are inactive as well."
+                    "No 2D mean-gradient statistics were accumulated since the last refinement. The render path "
+                    "in use does not produce them: the unscented projection (OpenCV camera models) has no backward "
+                    "pass, and world-space rasterization does not differentiate through the projected means. "
+                    "Skipping Gaussian insertion; the screen-space size thresholds for splitting and deletion are "
+                    "inactive as well."
                 )
                 self._warned_missing_gradient_accumulation = True
             device = self._model.means.device

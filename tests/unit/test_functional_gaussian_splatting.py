@@ -7,7 +7,6 @@ The pipeline is checked against :class:`GaussianSplat3d`, which composes the sam
 against itself across the dense, sparse, cropped and world-space paths.
 """
 
-import logging
 import unittest
 from unittest import mock
 
@@ -21,7 +20,8 @@ from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3
 from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
     ImageSpaceRenderBackend,
     WorldSpaceRenderBackend,
-    resolve_training_backend,
+    _ProjectedTrainingView,
+    _RenderedTrainingView,
 )
 from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import GaussianSplatReconstructionConfig
@@ -350,10 +350,11 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         torch.testing.assert_close(masked[:, : h // 2], crop[:, : h // 2], atol=1e-5, rtol=1e-5)
         self.assertEqual(float(masked[:, h // 2 :].abs().max()), 0.0)
         self.assertEqual(float(masked_alpha[:, h // 2 :].abs().max()), 0.0)
-        # A crop past the image edge is clipped, and a crop-space mask of the requested size still applies.
+        # A crop past the image edge keeps its requested size: the part inside the image is the render,
+        # the rest is background with zero alpha. A crop-space mask of the requested size still applies.
         edge_w, edge_h = 50, 40
         edge_mask = torch.ones(self.C, edge_h, edge_w, dtype=torch.bool, device=self.device)
-        edge, _ = model.render_from_projected_gaussians(
+        edge, edge_alpha = model.render_from_projected_gaussians(
             pg,
             crop_width=edge_w,
             crop_height=edge_h,
@@ -361,8 +362,13 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             crop_origin_h=self.H - 25,
             masks=edge_mask,
         )
-        self.assertEqual(tuple(edge.shape[1:3]), (25, 30))
-        torch.testing.assert_close(edge, full[:, self.H - 25 :, self.W - 30 :], atol=1e-5, rtol=1e-5)
+        self.assertEqual(tuple(edge.shape[1:3]), (edge_h, edge_w))
+        self.assertEqual(tuple(edge_alpha.shape[1:]), (edge_h, edge_w, 1))
+        torch.testing.assert_close(edge[:, :25, :30], full[:, self.H - 25 :, self.W - 30 :], atol=1e-5, rtol=1e-5)
+        self.assertEqual(float(edge[:, 25:].abs().max()), 0.0)
+        self.assertEqual(float(edge[:, :, 30:].abs().max()), 0.0)
+        self.assertEqual(float(edge_alpha[:, 25:].abs().max()), 0.0)
+        self.assertEqual(float(edge_alpha[:, :, 30:].abs().max()), 0.0)
         # Non-boolean masks are accepted with and without a crop.
         float_mask = torch.ones(self.C, self.H, self.W, device=self.device)
         with_float, _ = F.rasterize_screen_space_gaussians(
@@ -548,8 +554,8 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         distortion_coeffs = torch.zeros(self.C, 12, device=self.device)
         return camera_models, distortion_coeffs
 
-    def _forward_train(self, backend, model, config):
-        camera_models, distortion_coeffs = self._camera_batch()
+    def _forward_train(self, backend, model, config, camera_model: CameraModel = CameraModel.PINHOLE):
+        camera_models, distortion_coeffs = self._camera_batch(camera_model)
         return backend.forward_train(
             model=model,
             config=config,
@@ -580,52 +586,106 @@ class TestRenderBackends(FunctionalPipelineTestCase):
             view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
             self._assert_crops_are_slices(view)
         self.assertEqual(project.call_count, 1)
-        # The tile intersection is shared across the crops too, and each crop runs its own backward.
+        self.assertIsInstance(view, _ProjectedTrainingView)
+        # The tile intersection is shared across the crops too.
         pg = view.projected_gaussians
         self.assertIs(pg.tile_intersection(16), pg.tile_intersection(16))
-        self.assertTrue(view.backward_per_crop)
+
+    def _train_one_view(self, crops: int) -> tuple[GaussianSplat3d, list[torch.Tensor]]:
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        model.accumulate_mean_2d_gradients = True
+        view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
+        gt = torch.zeros(self.C, self.H, self.W, 3)
+        for _, _, crop, _ in crop_image_batch(gt, None, crops):
+            out = view.render_crop(crop)
+            # Sums, so the crop losses add up to exactly the full-image loss.
+            (out.image.square().sum() + out.alpha.sum()).backward()
+        # Nothing reaches the model until the shared backward runs once.
+        self.assertTrue(all(p.grad is None for p in params))
+        view.finish_backward()
+        return model, params
+
+    def test_crops_share_one_projection_backward_and_one_densification_sample(self):
+        whole_model, whole = self._train_one_view(crops=1)
+        cropped_model, cropped = self._train_one_view(crops=2)
+        for p_whole, p_cropped in zip(whole, cropped):
+            self.assertIsNotNone(p_whole.grad)
+            # The crop path splits the atomicAdd raster backward into four launches and adds their
+            # partial sums, so agreement is up to that summation order (a handful of elements at ~1e-4).
+            torch.testing.assert_close(p_cropped.grad, p_whole.grad, atol=1e-3, rtol=1e-3)
+        # The projection backward ran once per view in both cases, over the whole image's gradient, so
+        # the densification statistics agree. The kernel counts camera-Gaussian pairs, hence <= C.
+        self.assertTrue(
+            torch.equal(cropped_model.accumulated_gradient_step_counts, whole_model.accumulated_gradient_step_counts)
+        )
+        self.assertEqual(int(whole_model.accumulated_gradient_step_counts.max()), self.C)
+        self.assertGreater(float(whole_model.accumulated_mean_2d_gradient_norms.sum()), 0.0)
+        torch.testing.assert_close(
+            cropped_model.accumulated_mean_2d_gradient_norms,
+            whole_model.accumulated_mean_2d_gradient_norms,
+            atol=1e-3,
+            rtol=1e-3,
+        )
 
     def test_world_space_view_slices_one_render(self):
-        model = self._model(self._params())
+        params = self._params(requires_grad=True)
+        model = self._model(params)
         view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
+        self.assertIsInstance(view, _RenderedTrainingView)
         self._assert_crops_are_slices(view)
-        # One render serves every crop, so the loop sums the crop losses and runs backward once.
-        self.assertFalse(view.backward_per_crop)
+        gt = torch.zeros(self.C, self.H, self.W, 3)
+        for _, _, crop, _ in crop_image_batch(gt, None, 2):
+            view.render_crop(crop).image.sum().backward()
+        # Each crop's backward stops at the detached render; the model gets its gradient in one pass.
+        self.assertIsNone(params[0].grad)
+        view.finish_backward()
+        self.assertGreater(float(params[0].grad.abs().max()), 0.0)
 
-    def test_image_space_backend_rejects_forward_only_projections_for_training(self):
+    def test_image_space_backend_renders_forward_only_camera_batches_through_world_space(self):
+        # In a scene that mixes pinhole and distortion cameras, the pinhole batches keep image space and
+        # keep feeding the densification statistics, while the distortion batches take the world-space
+        # path so their geometry still gets a gradient.
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        model.accumulate_mean_2d_gradients = True
+        backend = ImageSpaceRenderBackend()
+        config = GaussianSplatReconstructionConfig()
+        full = (0, 0, self.W, self.H)
+
+        pinhole_view = self._forward_train(backend, model, config)
+        self.assertIsInstance(pinhole_view, _ProjectedTrainingView)
+        pinhole_view.render_crop(full).image.sum().backward()
+        pinhole_view.finish_backward()
+        norms_after_pinhole = model.accumulated_mean_2d_gradient_norms.clone()
+        self.assertGreater(float(norms_after_pinhole.sum()), 0.0)
+        means_grad_after_pinhole = params[0].grad.clone()
+
+        opencv_view = self._forward_train(backend, model, config, camera_model=CameraModel.OPENCV_RADTAN_5)
+        self.assertIsInstance(opencv_view, _RenderedTrainingView)
+        opencv_view.render_crop(full).image.sum().backward()
+        opencv_view.finish_backward()
+        self.assertFalse(torch.equal(params[0].grad, means_grad_after_pinhole), "world space trained the geometry")
+        torch.testing.assert_close(model.accumulated_mean_2d_gradient_norms, norms_after_pinhole)
+
+    def test_image_space_validation_reports_forward_only_cameras_and_probes_their_path(self):
         model = self._model(self._params())
         backend = ImageSpaceRenderBackend()
-        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]))
-        with self.assertRaisesRegex(ValueError, "world_space"):
+        module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
+        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
+        with self.assertLogs(module_logger, level="WARNING") as logs:
             backend.validate_scene_cameras(model, opencv, GaussianSplatReconstructionConfig(), self.device)
-        pinhole_unscented = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]))
-        with self.assertRaisesRegex(ValueError, "world_space"):
+        self.assertIn("OPENCV_RADTAN_5", logs.output[0])
+        self.assertIn("world-space", logs.output[0])
+        self.assertIn("densification", logs.output[0].lower())
+        pinhole_unscented = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        with self.assertLogs(module_logger, level="WARNING"):
             backend.validate_scene_cameras(
                 model, pinhole_unscented, GaussianSplatReconstructionConfig(projection_method="unscented"), self.device
             )
-        # An analytic pinhole scene still validates; an empty dataset makes the probe a no-op.
-        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]))
-        pinhole.__len__.return_value = 0
-        backend.validate_scene_cameras(model, pinhole, GaussianSplatReconstructionConfig(), self.device)
-
-    def test_training_backend_falls_back_to_world_space_for_forward_only_projections(self):
-        logger = logging.getLogger("test_training_backend_fallback")
-        image_space = ImageSpaceRenderBackend()
-        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]))
-        with self.assertLogs(logger, level="WARNING") as logs:
-            resolved = resolve_training_backend(image_space, opencv, GaussianSplatReconstructionConfig(), logger)
-        self.assertIsInstance(resolved, WorldSpaceRenderBackend)
-        self.assertIn("OPENCV_RADTAN_5", logs.output[0])
-        self.assertIn("densification", logs.output[0].lower())
-        # Analytic scenes keep the requested backend, and world space is never second-guessed.
-        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]))
-        self.assertIs(
-            resolve_training_backend(image_space, pinhole, GaussianSplatReconstructionConfig(), logger), image_space
-        )
-        world_space = WorldSpaceRenderBackend()
-        self.assertIs(
-            resolve_training_backend(world_space, opencv, GaussianSplatReconstructionConfig(), logger), world_space
-        )
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            backend.validate_scene_cameras(model, pinhole, GaussianSplatReconstructionConfig(), self.device)
 
 
 if __name__ == "__main__":
