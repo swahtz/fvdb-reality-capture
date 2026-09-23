@@ -510,26 +510,25 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         pixels = F.as_pixel_jagged(torch.zeros(self.C, 4, 2, dtype=torch.int32, device=self.device))
         self.assertEqual(pixels.num_tensors, self.C)
 
-    def test_projected_splats_cache_tiles_and_reject_bad_crops(self):
+    def test_projected_splats_render_crops_outside_the_image_as_background(self):
         model = self._model(self._params())
         pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
-        self.assertIs(pg.tile_intersection(16), pg.tile_intersection(16))
-        self.assertIsNot(pg.tile_intersection(16), pg.tile_intersection(32))
         self.assertIs(pg.opacities, pg.opacities)
+        # Tile intersections are computed on demand, not held by the projection.
+        self.assertIsNot(pg.tile_intersection(16), pg.tile_intersection(16))
+        background = torch.tensor([[0.2, 0.4, 0.6]] * self.C, device=self.device)
         for origin_w, origin_h in ((self.W, 0), (0, self.H), (self.W + 5, self.H + 5)):
-            with self.assertRaises(ValueError):
-                model.render_from_projected_gaussians(
-                    pg, crop_width=10, crop_height=10, crop_origin_w=origin_w, crop_origin_h=origin_h
-                )
-            with self.assertRaises(ValueError):
-                model.render_from_projected_gaussians(
-                    pg,
-                    crop_width=10,
-                    crop_height=10,
-                    crop_origin_w=origin_w,
-                    crop_origin_h=origin_h,
-                    masks=torch.ones(self.C, 10, 10, dtype=torch.bool, device=self.device),
-                )
+            images, alphas = model.render_from_projected_gaussians(
+                pg,
+                crop_width=10,
+                crop_height=10,
+                crop_origin_w=origin_w,
+                crop_origin_h=origin_h,
+                backgrounds=background,
+            )
+            self.assertEqual(tuple(images.shape), (self.C, 10, 10, 3))
+            torch.testing.assert_close(images, background[:, None, None, :].expand_as(images))
+            self.assertEqual(float(alphas.abs().max()), 0.0)
 
     def test_empty_selection(self):
         params = self._params()
@@ -580,16 +579,21 @@ class TestRenderBackends(FunctionalPipelineTestCase):
 
     def test_image_space_view_projects_once_and_renders_every_crop_from_it(self):
         model = self._model(self._params())
-        with mock.patch.object(
-            model, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
-        ) as project:
+        with (
+            mock.patch.object(
+                model, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+            ) as project,
+            mock.patch(
+                "fvdb_reality_capture.radiance_fields.gaussian_splatting.intersect_gaussian_tiles",
+                wraps=F.intersect_gaussian_tiles,
+            ) as intersect,
+        ):
             view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
             self._assert_crops_are_slices(view)
+        # Projection and tile intersection each ran once for the whole view, however many crops.
         self.assertEqual(project.call_count, 1)
+        self.assertEqual(intersect.call_count, 1)
         self.assertIsInstance(view, _ProjectedTrainingView)
-        # The tile intersection is shared across the crops too.
-        pg = view.projected_gaussians
-        self.assertIs(pg.tile_intersection(16), pg.tile_intersection(16))
 
     def _train_one_view(self, crops: int) -> tuple[GaussianSplat3d, list[torch.Tensor]]:
         params = self._params(requires_grad=True)

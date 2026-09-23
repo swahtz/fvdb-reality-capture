@@ -30,6 +30,7 @@ from ..functional import (
     rasterize_num_contributing_gaussians_sparse,
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
+    pad_crop,
     rasterize_world_space_gaussians,
     sh_degree_from_coefficients,
     validate_crop,
@@ -92,7 +93,6 @@ class ProjectedGaussianSplats:
         # Computed here, alongside the features, so the projection is a consistent snapshot of the model.
         # Deriving them at render time would mix the logits as they are then with the geometry as it was.
         self._opacities = compute_gaussian_opacities(logit_opacities, projected)
-        self._tiles: dict[int, GaussianTileIntersection] = {}
 
     @property
     def projected_gaussians(self) -> ProjectedGaussians:
@@ -107,8 +107,11 @@ class ProjectedGaussianSplats:
 
     def tile_intersection(self, tile_size: int = 16) -> GaussianTileIntersection:
         """
-        Return the tile intersections of the projected Gaussians for a tile size, computing them once and
-        caching the result, so that rendering several crops from one projection does not repeat the work.
+        Compute the tile intersections of the projected Gaussians for a tile size.
+
+        Nothing is cached, so holding a projection does not hold tile buffers. A caller rendering several
+        crops from one projection should keep the result and pass it to the rasterization stages in
+        :mod:`fvdb_reality_capture.functional` itself, as the training views do.
 
         Args:
             tile_size (int): The tile side length in pixels. Default is 16.
@@ -117,11 +120,7 @@ class ProjectedGaussianSplats:
             tiles (GaussianTileIntersection): The tile intersections, as consumed by the rasterization stages
                 in :mod:`fvdb_reality_capture.functional`.
         """
-        tiles = self._tiles.get(tile_size)
-        if tiles is None:
-            tiles = intersect_gaussian_tiles(self._projected, tile_size=tile_size, opacities=self.opacities)
-            self._tiles[tile_size] = tiles
-        return tiles
+        return intersect_gaussian_tiles(self._projected, tile_size=tile_size, opacities=self.opacities)
 
     @property
     def logit_opacities(self) -> torch.Tensor:
@@ -2029,8 +2028,9 @@ class GaussianSplat3d:
 
         .. note::
 
-            If your crop goes beyond the image boundaries, the resulting image will be clipped to
-            be within the image boundaries.
+            The output always has the requested crop size. Where the crop runs past the image boundary,
+            the part inside the image is rendered and the rest is filled with the background at zero
+            alpha; a crop that lies entirely outside the image is all background.
 
 
         Example:
@@ -2106,11 +2106,15 @@ class GaussianSplat3d:
         origin_w = crop_origin_w if crop_origin_w >= 0 else 0
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
+        requested_h, requested_w = crop_h, crop_w
+        if origin_w >= width or origin_h >= height:
+            # Entirely outside the image: nothing to rasterize, so the crop is all background at zero alpha.
+            empty = pg.render_quantities.new_zeros(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
+            return pad_crop(empty, empty[..., :1], requested_h, requested_w, backgrounds)
         crop = None
         full_masks = masks
-        requested_h, requested_w = crop_h, crop_w
         if is_crop:
-            # Rejects crops outside the image; clips the size at the image edge.
+            # Clips the crop at the image edge; the clipped part is padded back below.
             crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
             origin_w, origin_h, crop_w, crop_h = crop
             if masks is not None:
@@ -2136,17 +2140,8 @@ class GaussianSplat3d:
             masks=full_masks,
             crop=crop,
         )
-        if crop is not None and (crop_h, crop_w) != (requested_h, requested_w):
-            # The crop ran past the image edge. Fill the part outside the image with the background at
-            # zero alpha so the output has the requested size, which callers stacking crops rely on.
-            padded = images.new_zeros(images.shape[0], requested_h, requested_w, images.shape[-1])
-            if backgrounds is not None:
-                padded[:] = backgrounds.to(padded)[:, None, None, :]
-            padded[:, :crop_h, :crop_w] = images
-            padded_alphas = alphas.new_zeros(alphas.shape[0], requested_h, requested_w, 1)
-            padded_alphas[:, :crop_h, :crop_w] = alphas
-            return padded, padded_alphas
-        return images, alphas
+        # A crop that ran past the image edge keeps its requested size, with the outside as background.
+        return pad_crop(images, alphas, requested_h, requested_w, backgrounds)
 
     def render_depths(
         self,
@@ -3275,13 +3270,6 @@ class GaussianSplat3d:
                 jagged tensor containing the weights of the contributing Gaussians of each rendered pixel for each camera. The weights are in row-major order and
                 sum to 1 for each pixel if that pixel is opaque (alpha=1).
         """
-        # TODO: Projection currently always evaluates SH, but this method only needs
-        # geometric projection (2D means, conics, opacities) -- the SH color values are
-        # unused.  Ideally rendering should be more generic: accept an arbitrary feature
-        # tensor (e.g. integer IDs, raw features) without requiring SH evaluation.  That
-        # would also let us avoid the wasted SH computation here and support additional
-        # shading models in the future.  For now we just render "deep IDs" as a fixed
-        # function.  (Ported from the C++ renderContributingGaussianIdsImpl TODO.)
         with torch.no_grad():
             projected = self._project(
                 world_to_camera_matrices,

@@ -31,6 +31,7 @@ from ._projection import project_gaussians, requires_distortion_coeffs, resolve_
 from ._rasterization import (
     Crop,
     apply_crop,
+    pad_crop,
     pixel_mask_to_tile_mask,
     rasterize_screen_space_gaussians,
     rasterize_screen_space_gaussians_sparse,
@@ -72,6 +73,7 @@ __all__ = [
     "Crop",
     "validate_crop",
     "apply_crop",
+    "pad_crop",
     # Analysis
     "rasterize_num_contributing_gaussians",
     "rasterize_num_contributing_gaussians_sparse",

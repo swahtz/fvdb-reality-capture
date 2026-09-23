@@ -1536,8 +1536,9 @@ class GaussianSplatReconstruction:
                 # One backward through the shared per-view work (projection and features, or the world-space
                 # render) with the gradient every crop accumulated, so it runs once however many crops there are.
                 training_view.finish_backward()
-                # Release the view and its render before the next step projects, so two never coexist.
-                del training_view, render_outputs
+                # Release the view before the next step projects, so two never coexist. The rendered crop is a
+                # view into the full-size raster buffer, so it has to go too, or the buffer lives on through it.
+                del training_view, render_outputs, image
 
                 # Refine the gaussians via splitting/duplication/pruning
                 if (

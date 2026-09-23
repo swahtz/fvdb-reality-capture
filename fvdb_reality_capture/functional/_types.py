@@ -125,7 +125,8 @@ class SparseGaussianTileIntersection:
     """The requested pixels with per-camera duplicates removed. Equal to :attr:`pixels_to_render` if none."""
 
     inverse_indices: torch.Tensor
-    """Index into the flat unique pixels for each flat requested pixel, ``[num_requested]``."""
+    """Index into the flat unique pixels for each flat requested pixel, ``[num_requested]``. Empty when
+    :attr:`has_duplicates` is ``False``, since nothing needs reordering then."""
 
     has_duplicates: bool
     """Whether :attr:`pixels_to_render` contained duplicate pixels within a camera."""

@@ -86,6 +86,7 @@ def deduplicate_pixels(
             is kept, and the unique pixels are in the order they were first requested. Pixels outside
             the image are never merged with anything.
         inverse_indices (torch.Tensor): For each flat requested pixel, its index into the flat unique pixels.
+            Empty when there are no duplicates, since nothing needs reordering then.
         has_duplicates (bool): Whether anything was removed. When ``False`` the input is returned as is.
     """
     jdata = pixels_to_render.jdata
@@ -117,7 +118,7 @@ def deduplicate_pixels(
     group_ids = is_group_start.long().cumsum(0) - 1
     num_unique = int(group_ids[-1].item()) + 1
     if num_unique == total_pixels:
-        return pixels_to_render, torch.arange(total_pixels, dtype=torch.long, device=device), False
+        return pixels_to_render, torch.empty(0, dtype=torch.long, device=device), False
 
     # Order the unique pixels by first request rather than by sorted key, and remap the groups to match.
     unique_orig_indices, order = sort_perm[is_group_start].sort()

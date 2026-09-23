@@ -5116,7 +5116,7 @@ class TestDeduplicatePixels(unittest.TestCase):
         unique, inv, has_dups = self._dedup(pixels)
         self.assertFalse(has_dups)
         self.assertEqual(unique.jdata.shape[0], 5)
-        self.assertEqual(inv.shape[0], 5)
+        self.assertEqual(inv.shape[0], 0)  # nothing to reorder without duplicates
 
     @parameterized.expand([(torch.int32,), (torch.int64,)])
     def test_some_duplicates(self, dtype):

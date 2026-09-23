@@ -105,18 +105,58 @@ def apply_crop(images: torch.Tensor, alphas: torch.Tensor, crop: Crop | None) ->
     """
     if crop is None:
         return images, alphas
+    return _window(images, crop), _window(alphas, crop)
+
+
+def _window(tensor: torch.Tensor, crop: Crop) -> torch.Tensor:
     origin_w, origin_h, width, height = crop
-    return (
-        images[:, origin_h : origin_h + height, origin_w : origin_w + width],
-        alphas[:, origin_h : origin_h + height, origin_w : origin_w + width],
-    )
+    return tensor[:, origin_h : origin_h + height, origin_w : origin_w + width]
 
 
 def _crop_mask(mask: torch.Tensor, crop: Crop | None) -> torch.Tensor:
-    if crop is None:
-        return mask
-    origin_w, origin_h, width, height = crop
-    return mask[:, origin_h : origin_h + height, origin_w : origin_w + width]
+    return mask if crop is None else _window(mask, crop)
+
+
+def _background_like(images: torch.Tensor, backgrounds: torch.Tensor | None) -> torch.Tensor:
+    """Per-camera background features as ``[C, 1, 1, D]``, broadcastable against ``images``; black if ``None``."""
+    if backgrounds is None:
+        return torch.zeros(images.shape[0], 1, 1, images.shape[-1], device=images.device, dtype=images.dtype)
+    return backgrounds.to(images)[:, None, None, :]
+
+
+def pad_crop(
+    images: torch.Tensor,
+    alphas: torch.Tensor,
+    height: int,
+    width: int,
+    backgrounds: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extend a rendered crop to ``height`` by ``width``, filling the added area with the background at zero alpha.
+
+    This is how a crop that runs past the image edge keeps the size that was asked for: the part inside
+    the image is rendered, the rest is background. Inputs already of the target size are returned as is.
+
+    Args:
+        images (torch.Tensor): Rendered crop, ``[C, h, w, D]`` with ``h <= height`` and ``w <= width``.
+        alphas (torch.Tensor): Its alphas, ``[C, h, w, 1]``.
+        height (int): Target height in pixels.
+        width (int): Target width in pixels.
+        backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
+
+    Returns:
+        images (torch.Tensor): ``[C, height, width, D]`` with the input in its top-left corner.
+        alphas (torch.Tensor): ``[C, height, width, 1]``, zero outside the input.
+    """
+    num_cameras, current_h, current_w, channels = images.shape
+    if (current_h, current_w) == (height, width):
+        return images, alphas
+    if current_h > height or current_w > width:
+        raise ValueError(f"pad_crop cannot shrink a {(current_h, current_w)} render to {(height, width)}")
+    padded = _background_like(images, backgrounds).expand(num_cameras, height, width, channels).clone()
+    padded[:, :current_h, :current_w] = images
+    padded_alphas = alphas.new_zeros(num_cameras, height, width, 1)
+    padded_alphas[:, :current_h, :current_w] = alphas
+    return padded, padded_alphas
 
 
 def pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.Tensor:
@@ -140,10 +180,7 @@ def _apply_pixel_mask(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fill masked-out pixels with the background and zero alpha; the tile mask only skips whole tiles."""
     keep = pixel_mask.unsqueeze(-1).to(images.dtype)
-    if backgrounds is not None:
-        background = backgrounds[:, None, None, :]
-    else:
-        background = torch.zeros(1, 1, 1, images.shape[-1], device=images.device, dtype=images.dtype)
+    background = _background_like(images, backgrounds)
     return images * keep + background * (1.0 - keep), alphas * keep
 
 
