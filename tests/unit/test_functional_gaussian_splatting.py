@@ -433,6 +433,26 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             for g, e in zip(got, expected):
                 self.assertTrue(torch.equal(g, e))
 
+    def test_sparse_analysis_keeps_a_trailing_camera_with_no_requested_pixels(self):
+        params = self._params()
+        means, quats, log_scales, logit_opacities, sh0, shN = params
+        w2c, K = self.w2c[:2], self.K[:2]
+        projected = F.project_gaussians(means, quats, log_scales, w2c, K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        busy = torch.tensor([[self.H // 2, self.W // 2], [self.H // 2 + 3, self.W // 2 + 3]], device=self.device)
+        empty = torch.empty(0, 2, dtype=torch.int64, device=self.device)
+        # Camera 0 has a duplicate (so the expansion path runs); camera 1 requests nothing.
+        pixels = JaggedTensor([torch.cat([busy, busy[:1]]), empty])
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, opacities)
+        self.assertTrue(sparse_tiles.has_duplicates)
+        for result in F.rasterize_contributing_gaussian_ids_sparse(projected, opacities, sparse_tiles):
+            self.assertEqual(len(result), 2)
+            self.assertEqual(len(result[0].unbind()), 3)
+            self.assertEqual(len(result[1].unbind()), 0)
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
+        self.assertEqual(len(counts), 2)
+        self.assertEqual(counts[1].jdata.numel(), 0)
+
     def test_single_camera_sparse_analysis_keeps_camera_nesting(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params

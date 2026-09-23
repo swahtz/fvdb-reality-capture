@@ -170,13 +170,28 @@ def _expand_contributions(
     # jidx is empty for a single camera, so derive each pixel's camera from the offsets instead.
     requested_offsets = requested.joffsets.to(device).long()
     pixels_per_camera = requested_offsets[1:] - requested_offsets[:-1]
-    camera = torch.repeat_interleave(torch.arange(pixels_per_camera.numel(), device=device), pixels_per_camera)
+    num_cameras = pixels_per_camera.numel()
+    camera = torch.repeat_interleave(torch.arange(num_cameras, device=device), pixels_per_camera)
     within_camera = torch.arange(camera.numel(), device=device) - requested_offsets[camera]
     list_ids = torch.stack([camera, within_camera], dim=1).to(torch.int32)
-    return (
-        JaggedTensor.from_data_offsets_and_list_ids(ids.jdata.index_select(0, gather), offsets, list_ids),
-        JaggedTensor.from_data_offsets_and_list_ids(weights.jdata.index_select(0, gather), offsets, list_ids),
-    )
+
+    def nest(per_contribution: torch.Tensor) -> JaggedTensor:
+        data = per_contribution.index_select(0, gather)
+        expanded = JaggedTensor.from_data_offsets_and_list_ids(data, offsets, list_ids)
+        if len(expanded) == num_cameras:
+            return expanded
+        # from_data_offsets_and_list_ids takes the camera count from the largest list id, so cameras after
+        # the last one with a requested pixel are dropped. The nested constructor keeps them; it costs one
+        # Python object per pixel, so it is used only when that happens.
+        per_pixel = JaggedTensor.from_data_and_offsets(data, offsets).unbind()
+        nested: list[list[torch.Tensor]] = []
+        start = 0
+        for count in pixels_per_camera.tolist():
+            nested.append(list(per_pixel[start : start + count]))
+            start += count
+        return JaggedTensor(nested)
+
+    return nest(ids.jdata), nest(weights.jdata)
 
 
 def rasterize_contributing_gaussian_ids_sparse(
