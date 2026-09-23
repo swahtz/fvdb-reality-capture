@@ -73,8 +73,9 @@ class FunctionalPipelineTestCase(unittest.TestCase):
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H, **kwargs)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected, render_mode=render_mode)
-        tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
-        return F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        return F.rasterize_screen_space_gaussians(projected, features, opacities, tiles)
 
 
 class TestStageOutputs(FunctionalPipelineTestCase):
@@ -123,7 +124,7 @@ class TestStageOutputs(FunctionalPipelineTestCase):
     def test_tile_intersection_contract(self):
         params = self._params()
         projected = F.project_gaussians(*params[:3], self.w2c, self.K, self.W, self.H)
-        tiles = F.intersect_gaussian_tiles(projected, params[3], tile_size=16)
+        tiles = F.intersect_gaussian_tiles(projected, F.compute_gaussian_opacities(params[3], projected), tile_size=16)
         self.assertEqual(tuple(tiles.tile_offsets.shape), (self.C, tiles.num_tiles_h, tiles.num_tiles_w))
         self.assertEqual(tiles.num_tiles_h, -(-self.H // 16))
         self.assertEqual(tiles.num_tiles_w, -(-self.W // 16))
@@ -172,9 +173,10 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         self.assertFalse(projected.is_differentiable)
         self.assertFalse(projected.means2d.requires_grad)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
-        tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
         images, alphas = F.rasterize_world_space_gaussians(
-            means, quats, log_scales, projected, features, logit_opacities, self.w2c, self.K, tiles
+            means, quats, log_scales, projected, features, opacities, self.w2c, self.K, tiles
         )
         images.mean().backward()
         for p in (means, quats, log_scales, logit_opacities, sh0):
@@ -194,7 +196,7 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         )
         with self.assertRaises(RuntimeError):
             F.rasterize_world_space_gaussians(
-                means, quats, log_scales, opencv, features.detach(), logit_opacities, self.w2c, self.K, tiles
+                means, quats, log_scales, opencv, features.detach(), opacities.detach(), self.w2c, self.K, tiles
             )
 
         params_oo = self._params()
@@ -236,21 +238,20 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
         dense, dense_alpha = F.rasterize_screen_space_gaussians(
-            projected, features, logit_opacities, F.intersect_gaussian_tiles(projected, logit_opacities)
+            projected, features, opacities, F.intersect_gaussian_tiles(projected, opacities)
         )
         for with_duplicates in (False, True):
             pixels = self._pixels(with_duplicates)
-            sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, logit_opacities)
+            sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, opacities)
             self.assertEqual(sparse_tiles.has_duplicates, with_duplicates)
-            rendered, alphas = F.rasterize_screen_space_gaussians_sparse(
-                projected, features, logit_opacities, sparse_tiles
-            )
+            rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, opacities, sparse_tiles)
             self.assertEqual(len(rendered), self.C)
             all_tiles = torch.ones_like(sparse_tiles.active_tile_mask)
             same, _ = F.rasterize_screen_space_gaussians_sparse(
-                projected, features, logit_opacities, sparse_tiles, tile_masks=all_tiles
+                projected, features, opacities, sparse_tiles, tile_masks=all_tiles
             )
             torch.testing.assert_close(same.jdata, rendered.jdata)
             for c in range(self.C):
@@ -264,9 +265,10 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         means, quats, log_scales, logit_opacities, sh0, shN = params
         pixels = self._pixels(with_duplicates=True)
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
-        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, logit_opacities)
-        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, logit_opacities, sparse_tiles)
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, opacities)
+        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, opacities, sparse_tiles)
         rendered_oo, alphas_oo = self._model(self._params()).sparse_render_images(
             pixels, self.w2c, self.K, self.W, self.H, 0.01, 1e10
         )
@@ -280,24 +282,25 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
-        tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
-        full, full_alpha = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        full, full_alpha = F.rasterize_screen_space_gaussians(projected, features, opacities, tiles)
         ox, oy, w, h = 37, 21, 90, 60
         crop, crop_alpha = F.rasterize_screen_space_gaussians(
-            projected, features, logit_opacities, tiles, crop=(ox, oy, w, h)
+            projected, features, opacities, tiles, crop=(ox, oy, w, h)
         )
         self.assertEqual(tuple(crop.shape), (self.C, h, w, 3))
         torch.testing.assert_close(crop, full[:, oy : oy + h, ox : ox + w], atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(crop_alpha, full_alpha[:, oy : oy + h, ox : ox + w], atol=1e-5, rtol=1e-5)
         # Clamped to the image, invalid crops rejected.
         clamped, _ = F.rasterize_screen_space_gaussians(
-            projected, features, logit_opacities, tiles, crop=(self.W - 10, self.H - 5, 100, 100)
+            projected, features, opacities, tiles, crop=(self.W - 10, self.H - 5, 100, 100)
         )
         self.assertEqual(tuple(clamped.shape[1:3]), (5, 10))
         for bad in ((-1, 0, 10, 10), (0, 0, 0, 10), (self.W, 0, 10, 10)):
             with self.assertRaises(ValueError):
-                F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, crop=bad)
+                F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, crop=bad)
 
         # The OO crop path agrees, including a mask given in crop coordinates.
         model = self._model(params)
@@ -330,7 +333,7 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         # Non-boolean masks are accepted with and without a crop.
         float_mask = torch.ones(self.C, self.H, self.W, device=self.device)
         with_float, _ = F.rasterize_screen_space_gaussians(
-            projected, features, logit_opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
+            projected, features, opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
         )
         torch.testing.assert_close(with_float, crop, atol=1e-5, rtol=1e-5)
 
@@ -339,32 +342,34 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         means, quats, log_scales, logit_opacities, sh0, shN = params
         model = self._model(params)
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
-        tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
-        counts, alphas = F.rasterize_num_contributing_gaussians(projected, logit_opacities, tiles)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        counts, alphas = F.rasterize_num_contributing_gaussians(projected, opacities, tiles)
         counts_oo, alphas_oo = model.render_num_contributing_gaussians(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
         self.assertTrue(torch.equal(counts, counts_oo))
         torch.testing.assert_close(alphas, alphas_oo)
 
-        ids, weights = F.rasterize_contributing_gaussian_ids(projected, logit_opacities, tiles)
+        ids, weights = F.rasterize_contributing_gaussian_ids(projected, opacities, tiles)
         ids_oo, weights_oo = model.render_contributing_gaussian_ids(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
         self.assertTrue(torch.equal(ids.jdata, ids_oo.jdata))
         self.assertEqual(ids.ldim, 2)
         self.assertEqual(int(ids.jdata.numel()), int(counts.sum()))
-        top_ids, _ = F.rasterize_contributing_gaussian_ids(projected, logit_opacities, tiles, top_k_contributors=3)
+        top_ids, _ = F.rasterize_contributing_gaussian_ids(projected, opacities, tiles, top_k_contributors=3)
         self.assertLessEqual(int(top_ids.jdata.numel()), int(counts.clamp(max=3).sum()))
 
     def test_sparse_analysis_with_duplicates(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
-        tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
-        counts_dense, _ = F.rasterize_num_contributing_gaussians(projected, logit_opacities, tiles)
-        ids_dense, _ = F.rasterize_contributing_gaussian_ids(projected, logit_opacities, tiles)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        counts_dense, _ = F.rasterize_num_contributing_gaussians(projected, opacities, tiles)
+        ids_dense, _ = F.rasterize_contributing_gaussian_ids(projected, opacities, tiles)
 
         pixels = self._pixels(with_duplicates=True)
-        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, logit_opacities)
-        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, logit_opacities, sparse_tiles)
-        ids, weights = F.rasterize_contributing_gaussian_ids_sparse(projected, logit_opacities, sparse_tiles)
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, opacities)
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
+        ids, weights = F.rasterize_contributing_gaussian_ids_sparse(projected, opacities, sparse_tiles)
         self.assertEqual(ids.ldim, 2)
         for c in range(self.C):
             px = pixels[c].jdata
@@ -384,35 +389,40 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         means, quats, log_scales, logit_opacities, sh0, shN = params
         w2c, K = self.w2c[:1], self.K[:1]
         projected = F.project_gaussians(means, quats, log_scales, w2c, K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         pixels = self._pixels(with_duplicates=True)[0]  # one camera, duplicates included
         pixels = JaggedTensor([pixels.jdata])
-        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, logit_opacities)
-        ids, weights = F.rasterize_contributing_gaussian_ids_sparse(projected, logit_opacities, sparse_tiles)
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(pixels, projected, opacities)
+        ids, weights = F.rasterize_contributing_gaussian_ids_sparse(projected, opacities, sparse_tiles)
         self.assertEqual(ids.ldim, 2)
         self.assertEqual(len(ids), 1)
         self.assertEqual(len(ids[0].unbind()), pixels.jdata.shape[0])
-        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, logit_opacities, sparse_tiles)
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
         self.assertEqual(int(ids.jdata.numel()), int(counts.jdata.sum()))
 
-    def test_precomputed_opacities_match_and_are_validated(self):
+    def test_opacities_are_validated_and_made_contiguous(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
-        projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        projected = F.project_gaussians(
+            means, quats, log_scales, self.w2c, self.K, image_width=self.W, image_height=self.H
+        )
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
         opacities = F.compute_gaussian_opacities(logit_opacities, projected)
-        tiles = F.intersect_gaussian_tiles(projected, tile_size=16, opacities=opacities)
-        reference = F.intersect_gaussian_tiles(projected, logit_opacities, tile_size=16)
-        self.assertTrue(torch.equal(tiles.tile_offsets, reference.tile_offsets))
-        a, _ = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, opacities=opacities)
-        b, _ = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles)
-        torch.testing.assert_close(a, b)
+        self.assertEqual(tuple(opacities.shape), (self.C, means.shape[0]))
+        tiles = F.intersect_gaussian_tiles(projected, opacities, tile_size=16)
+        a, _ = F.rasterize_screen_space_gaussians(projected, features, opacities, tiles)
+        # Every stage checks the opacities against the projection's camera and Gaussian counts.
         with self.assertRaises(ValueError):
-            F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, opacities=opacities[:1])
+            F.rasterize_screen_space_gaussians(projected, features, opacities[:1], tiles)
+        with self.assertRaises(ValueError):
+            F.intersect_gaussian_tiles(projected, opacities[:, :-1], tile_size=16)
+        with self.assertRaises(ValueError):
+            F.rasterize_num_contributing_gaussians(projected, torch.sigmoid(logit_opacities), tiles)
         # A non-contiguous (expanded) opacity tensor is accepted and materialized, not handed to the kernel.
         expanded = torch.sigmoid(logit_opacities).unsqueeze(0).expand(self.C, -1)
         self.assertFalse(expanded.is_contiguous())
-        c, _ = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles, opacities=expanded)
-        torch.testing.assert_close(c, b)
+        c, _ = F.rasterize_screen_space_gaussians(projected, features, expanded, tiles)
+        torch.testing.assert_close(c, a)
 
     def test_projected_splats_opacities_recompute_when_a_graph_is_wanted(self):
         model = self._model(self._params(requires_grad=True))
@@ -470,13 +480,14 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
         empty = JaggedTensor([torch.empty(0, 2, dtype=torch.int64, device=self.device) for _ in range(self.C)])
-        sparse_tiles = F.intersect_gaussian_tiles_sparse(empty, projected, logit_opacities)
-        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, logit_opacities, sparse_tiles)
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(empty, projected, opacities)
+        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, opacities, sparse_tiles)
         self.assertEqual(tuple(rendered.jdata.shape), (0, 3))
         self.assertEqual(tuple(alphas.jdata.shape), (0, 1))
-        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, logit_opacities, sparse_tiles)
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
         self.assertEqual(counts.jdata.numel(), 0)
 
 

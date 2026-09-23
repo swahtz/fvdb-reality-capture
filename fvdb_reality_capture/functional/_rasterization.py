@@ -17,7 +17,7 @@ from ._autograd import (
     _RasterizeScreenSpaceGaussiansSparseFn,
     _RasterizeWorldSpaceGaussiansFn,
 )
-from ._opacity import resolve_opacities
+from ._opacity import check_opacities
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
 Crop = tuple[int, int, int, int]
@@ -134,43 +134,38 @@ def _apply_pixel_mask(
 def rasterize_screen_space_gaussians(
     projected: ProjectedGaussians,
     features: torch.Tensor,
-    logit_opacities: torch.Tensor,
+    opacities: torch.Tensor,
     tiles: GaussianTileIntersection,
     backgrounds: torch.Tensor | None = None,
     masks: torch.Tensor | None = None,
     crop: Crop | None = None,
-    *,
-    opacities: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Alpha-blend projected Gaussians into dense images.
 
-    Differentiable with respect to ``features``, ``logit_opacities`` and, for an ``ANALYTIC``
-    projection, the projection itself. The unscented projection is forward-only, so through this
-    function the 3D parameters receive no gradient; :func:`rasterize_world_space_gaussians` is the
-    training path for it. A ``crop``
-    selects a window of the images: tiles outside it are skipped and the result is exactly the
-    corresponding region of the uncropped render. The output buffers are still allocated at full
-    image size before slicing.
+    Differentiable with respect to ``features``, ``opacities`` and, for an ``ANALYTIC`` projection,
+    the projection itself. The unscented projection is forward-only, so through this function the 3D
+    parameters receive no gradient; :func:`rasterize_world_space_gaussians` is the training path for
+    it. A ``crop`` selects a window of the images: tiles outside it are skipped and the result is
+    exactly the corresponding region of the uncropped render. The output buffers are still allocated
+    at full image size before slicing.
 
     Args:
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         features (torch.Tensor): Per-camera, per-Gaussian features, ``[C, N, D]``.
-        logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
+        opacities (torch.Tensor): Per-camera opacities, ``[C, N]``, from :func:`compute_gaussian_opacities`.
+            Compute them once per render and pass the same tensor to every stage.
         tiles (GaussianTileIntersection): Output of :func:`intersect_gaussian_tiles` for ``projected``.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
         masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``. Masked-out pixels
             receive the background with zero alpha and no gradient.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep,
             clamped to the image.
-        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
-            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
-            ``logit_opacities`` when ``None``.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
-    opacities = resolve_opacities(logit_opacities, projected, opacities)
+    opacities = check_opacities(opacities, projected)
     crop, masks, tile_masks = _render_masks(crop, masks, projected.num_cameras, tiles, opacities.device)
     images, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
@@ -204,7 +199,7 @@ def rasterize_world_space_gaussians(
     log_scales: torch.Tensor,
     projected: ProjectedGaussians,
     features: torch.Tensor,
-    logit_opacities: torch.Tensor,
+    opacities: torch.Tensor,
     world_to_camera_matrices: torch.Tensor,
     projection_matrices: torch.Tensor,
     tiles: GaussianTileIntersection,
@@ -212,14 +207,12 @@ def rasterize_world_space_gaussians(
     backgrounds: torch.Tensor | None = None,
     masks: torch.Tensor | None = None,
     crop: Crop | None = None,
-    *,
-    opacities: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Alpha-blend 3D Gaussians into dense images by evaluating them along per-pixel rays.
 
-    Differentiable with respect to the 3D parameters, ``features`` and ``logit_opacities``, which makes
-    it the training path for the unscented projection. The projection supplies the tile
-    intersections and the camera model; the 3D parameters are evaluated directly.
+    Differentiable with respect to the 3D parameters, ``features`` and ``opacities``, which makes it
+    the training path for the unscented projection. The projection supplies the tile intersections
+    and the camera model; the 3D parameters are evaluated directly.
 
     Args:
         means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
@@ -227,7 +220,7 @@ def rasterize_world_space_gaussians(
         log_scales (torch.Tensor): Natural-log scale factors, ``[N, 3]``.
         projected (ProjectedGaussians): Output of :func:`project_gaussians` for these Gaussians and cameras.
         features (torch.Tensor): Per-camera, per-Gaussian features, ``[C, N, D]``.
-        logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
+        opacities (torch.Tensor): Per-camera opacities, ``[C, N]``, from :func:`compute_gaussian_opacities`.
         world_to_camera_matrices (torch.Tensor): World-to-camera transforms, ``[C, 4, 4]``.
         projection_matrices (torch.Tensor): Camera intrinsics, ``[C, 3, 3]``.
         tiles (GaussianTileIntersection): Output of :func:`intersect_gaussian_tiles` for ``projected``.
@@ -236,15 +229,12 @@ def rasterize_world_space_gaussians(
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
         masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep.
-        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
-            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
-            ``logit_opacities`` when ``None``.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
-    opacities = resolve_opacities(logit_opacities, projected, opacities)
+    opacities = check_opacities(opacities, projected)
     if distortion_coeffs is None:
         if projected.camera_model not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC):
             raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
@@ -287,36 +277,32 @@ def rasterize_world_space_gaussians(
 def rasterize_screen_space_gaussians_sparse(
     projected: ProjectedGaussians,
     features: torch.Tensor,
-    logit_opacities: torch.Tensor,
+    opacities: torch.Tensor,
     sparse_tiles: SparseGaussianTileIntersection,
     backgrounds: torch.Tensor | None = None,
     tile_masks: torch.Tensor | None = None,
-    *,
-    opacities: torch.Tensor | None = None,
 ) -> tuple[JaggedTensor, JaggedTensor]:
     """Alpha-blend projected Gaussians at the requested pixels only.
 
-    Differentiable with respect to the projection, ``features`` and ``logit_opacities``. Results are
-    returned in the order of ``sparse_tiles.pixels_to_render``, duplicates included.
+    Differentiable with respect to ``features``, ``opacities`` and, for an ``ANALYTIC`` projection, the
+    projection itself. Results are returned in the order of ``sparse_tiles.pixels_to_render``,
+    duplicates included.
 
     Args:
         projected (ProjectedGaussians): Output of :func:`project_gaussians`.
         features (torch.Tensor): Per-camera, per-Gaussian features, ``[C, N, D]``.
-        logit_opacities (torch.Tensor): Logit opacities, ``[N]``.
+        opacities (torch.Tensor): Per-camera opacities, ``[C, N]``, from :func:`compute_gaussian_opacities`.
         sparse_tiles (SparseGaussianTileIntersection): Output of :func:`intersect_gaussian_tiles_sparse`.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
         tile_masks (torch.Tensor | None): Boolean per-tile render mask, ``[C, num_tiles_h, num_tiles_w]``.
             Unlike the dense rasterizers this is per tile, since the pixels to render are explicit;
             use :func:`pixel_mask_to_tile_mask` to derive it from a per-pixel mask.
-        opacities (torch.Tensor | None): Precomputed ``[C, N]`` opacities from
-            :func:`compute_gaussian_opacities`, to avoid recomputing them per stage. Derived from
-            ``logit_opacities`` when ``None``.
 
     Returns:
         features (JaggedTensor): Blended features per requested pixel, one ``[P_c, D]`` list per camera.
         alphas (JaggedTensor): Accumulated alpha per requested pixel, one ``[P_c, 1]`` list per camera.
     """
-    opacities = resolve_opacities(logit_opacities, projected, opacities)
+    opacities = check_opacities(opacities, projected)
     rendered, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeScreenSpaceGaussiansSparseFn.apply(

@@ -32,11 +32,14 @@ except tile intersection.
        means, sh0, shN, world_to_cam, projected, render_mode=GaussianRenderMode.FEATURES
    )
 
+   # Per-camera opacities, computed once and shared by stages 3 and 4
+   opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+
    # Stage 3: bin Gaussians into image tiles (opacities enable tighter culling)
-   tiles = F.intersect_gaussian_tiles(projected, logit_opacities)
+   tiles = F.intersect_gaussian_tiles(projected, opacities)
 
    # Stage 4: alpha-blend into images
-   images, alphas = F.rasterize_screen_space_gaussians(projected, features, logit_opacities, tiles)
+   images, alphas = F.rasterize_screen_space_gaussians(projected, features, opacities, tiles)
 
    loss = torch.nn.functional.l1_loss(images, target_images)
    loss.backward()  # gradients reach means, quats, log_scales, logit_opacities, sh0 and shN
@@ -100,8 +103,6 @@ Stage 4: Rasterization
 .. autofunction:: rasterize_screen_space_gaussians_sparse
 
 .. autofunction:: compute_gaussian_opacities
-
-.. autofunction:: resolve_opacities
 
 .. autofunction:: validate_crop
 

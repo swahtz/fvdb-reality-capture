@@ -30,32 +30,22 @@ def compute_gaussian_opacities(logit_opacities: torch.Tensor, projected: Project
     return opacities
 
 
-def resolve_opacities(
-    logit_opacities: torch.Tensor, projected: ProjectedGaussians, opacities: torch.Tensor | None
-) -> torch.Tensor:
-    """Return ``opacities`` if the caller precomputed them, else derive them from ``logit_opacities``.
-
-    Lets a pipeline that runs several stages compute the ``[C, N]`` opacities once with
-    :func:`compute_gaussian_opacities` and pass them through, instead of each stage materializing
-    its own copy.
+def check_opacities(opacities: torch.Tensor, projected: ProjectedGaussians) -> torch.Tensor:
+    """Validate per-camera opacities against a projection and return them ready for the kernels.
 
     Args:
-        logit_opacities (torch.Tensor): Logit opacities, shape ``[N]``.
-        projected (ProjectedGaussians): Projection whose camera count and compensations to use.
-        opacities (torch.Tensor | None): Precomputed opacities, shape ``[C, N]``, or ``None``.
+        opacities (torch.Tensor): Opacities from :func:`compute_gaussian_opacities`, shape ``[C, N]``.
+        projected (ProjectedGaussians): Projection the opacities were computed for.
 
     Returns:
-        opacities (torch.Tensor): Opacities in ``[0, 1]``, shape ``[C, N]``, contiguous and on the
-            projection's device.
+        opacities (torch.Tensor): The same values, contiguous and on the projection's device.
     """
-    if opacities is not None:
-        if tuple(opacities.shape) != (projected.num_cameras, projected.num_gaussians):
-            raise ValueError(
-                f"opacities must have shape [{projected.num_cameras}, {projected.num_gaussians}], got {tuple(opacities.shape)}"
-            )
-        if opacities.device != projected.means2d.device:
-            raise ValueError(f"opacities must be on {projected.means2d.device}, got {opacities.device}")
-        # The kernels index a dense [C, N] buffer, so an expanded or strided view is materialized here
-        # rather than failing inside the kernel.
-        return opacities.contiguous()
-    return compute_gaussian_opacities(logit_opacities, projected)
+    if tuple(opacities.shape) != (projected.num_cameras, projected.num_gaussians):
+        raise ValueError(
+            f"opacities must have shape [{projected.num_cameras}, {projected.num_gaussians}], got {tuple(opacities.shape)}"
+        )
+    if opacities.device != projected.means2d.device:
+        raise ValueError(f"opacities must be on {projected.means2d.device}, got {opacities.device}")
+    # The kernels index a dense [C, N] buffer, so an expanded or strided view is materialized here
+    # rather than failing inside the kernel.
+    return opacities.contiguous()

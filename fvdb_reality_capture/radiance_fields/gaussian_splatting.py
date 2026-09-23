@@ -1616,17 +1616,16 @@ class GaussianSplat3d:
                 self._log_scales,
                 projected,
                 features,
-                self._logit_opacities,
+                opacities,
                 world_to_camera_matrices,
                 projection_matrices,
                 tiles,
                 distortion_coeffs=distortion_coeffs,
                 backgrounds=backgrounds,
                 masks=masks,
-                opacities=opacities,
             )
         return rasterize_screen_space_gaussians(
-            projected, features, self._logit_opacities, tiles, backgrounds=backgrounds, masks=masks, opacities=opacities
+            projected, features, opacities, tiles, backgrounds=backgrounds, masks=masks
         )
 
     def _render_sparse(
@@ -1671,13 +1670,7 @@ class GaussianSplat3d:
             pixels_to_render, projected, tile_size=tile_size, opacities=opacities
         )
         return rasterize_screen_space_gaussians_sparse(
-            projected,
-            features,
-            self._logit_opacities,
-            sparse_tiles,
-            backgrounds=backgrounds,
-            tile_masks=masks,
-            opacities=opacities,
+            projected, features, opacities, sparse_tiles, backgrounds=backgrounds, tile_masks=masks
         )
 
     @staticmethod
@@ -2131,12 +2124,11 @@ class GaussianSplat3d:
         return rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
-            pg.logit_opacities,
+            pg.opacities,
             pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
             masks=full_masks,
             crop=crop,
-            opacities=pg.opacities,
         )
 
     def render_depths(
@@ -3085,7 +3077,7 @@ class GaussianSplat3d:
             )
             opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
-            return rasterize_num_contributing_gaussians(projected, self._logit_opacities, tiles, opacities=opacities)
+            return rasterize_num_contributing_gaussians(projected, opacities, tiles)
 
     @overload
     def sparse_render_num_contributing_gaussians(
@@ -3209,9 +3201,7 @@ class GaussianSplat3d:
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities
             )
-            counts, alphas = rasterize_num_contributing_gaussians_sparse(
-                projected, self._logit_opacities, sparse_tiles, opacities=opacities
-            )
+            counts, alphas = rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
         return self._sparse_result(pixels_to_render, counts, alphas)
 
     def render_contributing_gaussian_ids(
@@ -3292,9 +3282,7 @@ class GaussianSplat3d:
             )
             opacities = compute_gaussian_opacities(self._logit_opacities, projected)
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
-            return rasterize_contributing_gaussian_ids(
-                projected, self._logit_opacities, tiles, top_k_contributors, opacities=opacities
-            )
+            return rasterize_contributing_gaussian_ids(projected, opacities, tiles, top_k_contributors)
 
     @overload
     def sparse_render_contributing_gaussian_ids(
@@ -3417,9 +3405,7 @@ class GaussianSplat3d:
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities
             )
-            return rasterize_contributing_gaussian_ids_sparse(
-                projected, self._logit_opacities, sparse_tiles, top_k_contributors, opacities=opacities
-            )
+            return rasterize_contributing_gaussian_ids_sparse(projected, opacities, sparse_tiles, top_k_contributors)
 
     def relocate_gaussians(
         self,

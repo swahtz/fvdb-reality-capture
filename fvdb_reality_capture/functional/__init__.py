@@ -13,6 +13,9 @@ pipeline can insert its own logic anywhere:
 4. :func:`rasterize_screen_space_gaussians`, :func:`rasterize_world_space_gaussians` or
    :func:`rasterize_screen_space_gaussians_sparse` alpha-blends the features.
 
+Stages 3 and 4 take per-camera opacities, ``[C, N]``. Compute them once per render with
+:func:`compute_gaussian_opacities` and pass the same tensor to every stage.
+
 Every stage except tile intersection is differentiable. The kernels themselves live in
 :mod:`fvdb.functional`; :class:`~fvdb_reality_capture.GaussianSplat3d` composes these stages.
 """
@@ -23,7 +26,7 @@ from ._analysis import (
     rasterize_num_contributing_gaussians,
     rasterize_num_contributing_gaussians_sparse,
 )
-from ._opacity import compute_gaussian_opacities, resolve_opacities
+from ._opacity import compute_gaussian_opacities
 from ._projection import project_gaussians, resolve_projection_method
 from ._rasterization import (
     pixel_mask_to_tile_mask,
@@ -62,7 +65,6 @@ __all__ = [
     "rasterize_world_space_gaussians",
     "rasterize_screen_space_gaussians_sparse",
     "compute_gaussian_opacities",
-    "resolve_opacities",
     "pixel_mask_to_tile_mask",
     "validate_crop",
     # Analysis
