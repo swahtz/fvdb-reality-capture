@@ -1486,24 +1486,12 @@ class GaussianSplat3d:
         min_radius_2d: float,
         eps_2d: float,
         antialias: bool,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> ProjectedGaussians:
-        """Stage 1 for this model's Gaussians.
-
-        ``accumulate_statistics`` wires the enabled gradient accumulators into the projection, so a
-        backward through the projected means records the 2D mean gradients and step counts (and, in the
-        kernel, the radii). ``record_radii`` records each Gaussian's largest projected radius into the
-        radius accumulator here, in the forward; training passes it, since the kernel only records in a
-        backward that reaches the projected means, which world-space rasterization, frozen geometry and
-        the unscented projection never produce. Taking the maximum twice is harmless, so both may be on.
-        """
+        """Stage 1 for this model's Gaussians, wiring in the enabled densification accumulators."""
         # The accumulators exist (zeroed) whenever they are enabled, so refinement can read them on every
         # path; world-space rendering leaves the gradient ones out so its views do not count as samples.
         grad_norms, step_counts, max_radii = self._projection_accumulators()
-        if not accumulate_statistics:
-            grad_norms, step_counts = None, None
-        projected = project_gaussians(
+        return project_gaussians(
             self._means,
             self._quats,
             self._log_scales,
@@ -1523,10 +1511,6 @@ class GaussianSplat3d:
             accumulated_gradient_step_counts=step_counts,
             accumulated_max_2d_radii=max_radii,
         )
-        if record_radii and max_radii is not None:
-            with torch.no_grad():
-                max_radii.copy_(torch.maximum(max_radii, projected.radii.amax(dim=(0, 2)).to(max_radii.dtype)))
-        return projected
 
     def _project_and_opacities(
         self,
@@ -1542,8 +1526,6 @@ class GaussianSplat3d:
         min_radius_2d: float,
         eps_2d: float,
         antialias: bool,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> tuple[ProjectedGaussians, torch.Tensor]:
         """Stage 1 plus the per-camera opacities every later stage takes, computed once."""
         projected = self._project(
@@ -1559,8 +1541,6 @@ class GaussianSplat3d:
             min_radius_2d=min_radius_2d,
             eps_2d=eps_2d,
             antialias=antialias,
-            accumulate_statistics=accumulate_statistics,
-            record_radii=record_radii,
         )
         return projected, compute_gaussian_opacities(self._logit_opacities, projected)
 
@@ -1592,13 +1572,8 @@ class GaussianSplat3d:
         antialias: bool,
         sh_degree_to_use: int,
         render_mode: GaussianRenderMode,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
-        """Stages 1 and 2, bundled for later rendering with :meth:`render_from_projected_gaussians`.
-
-        ``accumulate_statistics`` and ``record_radii`` are passed to :meth:`_project`.
-        """
+        """Stages 1 and 2, bundled for later rendering with :meth:`render_from_projected_gaussians`."""
         projected, opacities = self._project_and_opacities(
             world_to_camera_matrices=world_to_camera_matrices,
             projection_matrices=projection_matrices,
@@ -1612,8 +1587,6 @@ class GaussianSplat3d:
             min_radius_2d=min_radius_2d,
             eps_2d=eps_2d,
             antialias=antialias,
-            accumulate_statistics=accumulate_statistics,
-            record_radii=record_radii,
         )
         render_quantities = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         return ProjectedGaussianSplats(
@@ -1667,7 +1640,6 @@ class GaussianSplat3d:
             min_radius_2d=min_radius_2d,
             eps_2d=eps_2d,
             antialias=antialias,
-            accumulate_statistics=not world_space,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
@@ -1766,8 +1738,6 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering depth images in those planes.
@@ -1837,15 +1807,6 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether a backward through this projection's means records the
-                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
-                Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
-            record_radii (bool): Record each Gaussian's largest projected radius into
-                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
-                that reaches the projected means, so a training forward passes ``True`` to cover world-space
-                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
-                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1867,8 +1828,6 @@ class GaussianSplat3d:
             antialias=antialias,
             sh_degree_to_use=-1,
             render_mode=GaussianRenderMode.DEPTH,
-            accumulate_statistics=accumulate_statistics,
-            record_radii=record_radii,
         )
 
     def project_gaussians_for_images(
@@ -1886,8 +1845,6 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images in those planes.
@@ -1957,15 +1914,6 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether a backward through this projection's means records the
-                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
-                Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
-            record_radii (bool): Record each Gaussian's largest projected radius into
-                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
-                that reaches the projected means, so a training forward passes ``True`` to cover world-space
-                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
-                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1987,8 +1935,6 @@ class GaussianSplat3d:
             antialias=antialias,
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES,
-            accumulate_statistics=accumulate_statistics,
-            record_radii=record_radii,
         )
 
     def project_gaussians_for_images_and_depths(
@@ -2006,8 +1952,6 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
-        accumulate_statistics: bool = True,
-        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images with depths
@@ -2086,15 +2030,6 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether a backward through this projection's means records the
-                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
-                Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
-            record_radii (bool): Record each Gaussian's largest projected radius into
-                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
-                that reaches the projected means, so a training forward passes ``True`` to cover world-space
-                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
-                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -2116,8 +2051,6 @@ class GaussianSplat3d:
             antialias=antialias,
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
-            accumulate_statistics=accumulate_statistics,
-            record_radii=record_radii,
         )
 
     def render_from_projected_gaussians(

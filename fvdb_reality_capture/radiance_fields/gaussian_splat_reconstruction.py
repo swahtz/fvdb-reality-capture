@@ -24,11 +24,10 @@ from scipy.spatial import cKDTree  # type: ignore
 from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import export_splats_to_usd
 
-from ..functional import Crop
-from ._gaussian_rendering import RenderBackend, TrainingView, resolve_render_backend
+from ._gaussian_rendering import RenderBackend, make_render_backend
 from ._gaussian_splat_viz import gaussian_splat_to_view_data
 from ._private.lpips import LPIPSLoss
-from ._private.utils import crop_image_batch, crop_loss_weight
+from ._private.utils import crop_image_batch
 from .camera_pose_adjust import CameraPoseAdjustment
 from .checkpoint import GAUSSIAN_SPLAT_RECONSTRUCTION_METHOD_VERSION
 from .gaussian_splat_dataset import SfmDataset
@@ -109,184 +108,6 @@ def _scale_shift_invariant_l1(
     return torch.stack(per_image_losses).mean()
 
 
-_SSIM_WINDOW = 11
-
-
-def _check_crop_size(image_sizes: np.ndarray, crops_per_image: int, patch_size: int | None = None) -> None:
-    """Raise unless every crop of every delivered training image covers at least the SSIM window.
-
-    Args:
-        image_sizes (np.ndarray): ``(I, 2)`` array of ``(height, width)`` per training image.
-        crops_per_image (int): Crops per side, as in :attr:`GaussianSplatReconstructionConfig.crops_per_image`.
-        patch_size (int | None): The dataset's random patch size, when it delivers patches rather than images.
-    """
-    if crops_per_image < 1:
-        raise ValueError(f"crops_per_image must be at least 1, got {crops_per_image}")
-    if len(image_sizes) == 0:
-        return
-    delivered = int(image_sizes.min()) if patch_size is None else min(int(image_sizes.min()), patch_size)
-    smallest = delivered // crops_per_image
-    if smallest < _SSIM_WINDOW:
-        raise ValueError(
-            f"crops_per_image={crops_per_image} gives crops as small as {smallest} pixels on the smallest delivered "
-            f"training image ({delivered} pixels); each crop must cover the {_SSIM_WINDOW}-pixel SSIM window"
-        )
-
-
-@dataclass
-class _DepthTargets:
-    """Depth supervision for one training view, in full-image pixel coordinates.
-
-    A term is off when its tensors are ``None``. The totals weight each crop's mean by its share of the
-    view's points or valid pixels, so the crops add up to the full-image loss.
-    """
-
-    sparse_depth: torch.Tensor | None = None  # [B, N]
-    sparse_depth_uv: torch.Tensor | None = None  # [B, N, 2], (u, v)
-    median_depths: torch.Tensor | None = None  # [B]
-    dense_depth: torch.Tensor | None = None  # [B, H, W]
-    dense_depth_valid: torch.Tensor | None = None  # [B, H, W], bool
-    dense_depth_is_relative: bool = False
-    num_sparse_points: int = field(init=False, default=0)
-    num_dense_valid: torch.Tensor | None = field(init=False, default=None)
-
-    def __post_init__(self) -> None:
-        if self.sparse_depth_uv is not None:
-            self.num_sparse_points = int(self.sparse_depth_uv.shape[1])
-        if self.dense_depth_valid is not None:
-            self.num_dense_valid = self.dense_depth_valid.sum().clamp(min=1.0)
-
-
-@dataclass(frozen=True)
-class _CropLosses:
-    """Detached loss terms of one crop, each already weighted by the crop's share of the view."""
-
-    total: torch.Tensor
-    l1: torch.Tensor
-    ssim: torch.Tensor
-    sparse_depth: torch.Tensor
-    dense_depth: torch.Tensor
-
-
-def _train_crop(
-    training_view: TrainingView,
-    crop: Crop,
-    crop_weight: float,
-    pixels: torch.Tensor,
-    mask_pixels: torch.Tensor | None,
-    depth_targets: _DepthTargets,
-    config: GaussianSplatReconstructionConfig,
-    device: torch.device,
-    background: torch.Tensor | None = None,
-) -> _CropLosses:
-    """Render one crop of a training view, compute its losses, and run its backward.
-
-    The crop's rasterization and loss graphs end at the view's detached copies of the shared per-view
-    work, so backward here frees them and accumulates the crop's gradient into those copies. Every
-    tensor holding a piece of that graph is local to this function and dies on return; a loss that
-    outlived the step would keep the copies, and their gradients, alive through the next forward pass.
-
-    Args:
-        training_view (TrainingView): The view the render backend returned for this step.
-        crop (Crop): Crop rectangle as ``(origin_w, origin_h, width, height)``.
-        crop_weight (float): The crop's share of the image area, from :func:`crop_loss_weight`.
-        pixels (torch.Tensor): Ground-truth pixels of the crop, ``[B, h, w, 3]``, ``uint8``.
-        mask_pixels (torch.Tensor | None): Pixels to supervise, ``[B, h, w]``; the rest take the rendered value.
-        depth_targets (_DepthTargets): Depth supervision of the view, in full-image coordinates.
-        config (GaussianSplatReconstructionConfig): Loss weights and options.
-        device (torch.device): Device the view renders on.
-        background (torch.Tensor | None): Background color, ``[1, 3]``, composited behind the render. Drawn
-            once per view so every crop of an image is supervised against the same target.
-
-    Returns:
-        _CropLosses: The detached, weighted loss terms.
-    """
-    pixels = pixels.to(device=device) / 255.0  # [B, h, w, 3], in [0, 1]
-    render_outputs = training_view.render_crop(crop)
-    image = render_outputs.image
-
-    if background is not None:
-        image = image + background * (1.0 - render_outputs.alpha)
-
-    if mask_pixels is not None:
-        # The ground truth takes the rendered value where the mask is off, so those pixels contribute no loss.
-        mask_pixels = mask_pixels.to(device)
-        pixels[~mask_pixels] = image.detach()[~mask_pixels]
-
-    l1 = nnf.l1_loss(image, pixels)
-    ssim_loss = 1.0 - ssim(image.permute(0, 3, 1, 2).contiguous(), pixels.permute(0, 3, 1, 2).contiguous())
-    loss = torch.lerp(l1, ssim_loss, config.ssim_lambda) * crop_weight  # type: ignore
-    sparse_depth_loss = loss.new_zeros(())
-    dense_depth_loss = loss.new_zeros(())
-
-    sparse_depth, sparse_depth_uv = depth_targets.sparse_depth, depth_targets.sparse_depth_uv
-    median_depths = depth_targets.median_depths
-    if sparse_depth is not None and sparse_depth_uv is not None and median_depths is not None:
-        if config.batch_size > 1:
-            raise NotImplementedError("Sparse depth loss is not implemented for batch_size > 1.")
-        if render_outputs.depth is None:
-            raise RuntimeError("Model did not render depth channel, but sparse depth loss is enabled.")
-        # The depth points are in full-image pixels while the render covers this crop. Points outside the
-        # crop read a clamped pixel and get zero weight, so nothing here syncs with the device.
-        crop_x, crop_y, crop_w, crop_h = crop
-        u = sparse_depth_uv[0, :, 0].long() - crop_x
-        v = sparse_depth_uv[0, :, 1].long() - crop_y
-        in_crop = ((u >= 0) & (u < crop_w) & (v >= 0) & (v < crop_h)).to(sparse_depth.dtype)  # [N]
-        u, v = u.clamp(0, crop_w - 1), v.clamp(0, crop_h - 1)
-        depth_uv = render_outputs.depth[..., 0][:, v, u]  # [B, N]
-        alpha_uv = render_outputs.alpha[:, v, u, 0]  # [B, N]
-        # Prediction and target are normalized by the median depth.
-        pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6) / median_depths.unsqueeze(1)  # [B, N]
-        target_depth = sparse_depth / median_depths.unsqueeze(1)
-        # The crop's points' share of the full-image mean absolute error.
-        sparse_depth_loss = (
-            ((pred_depth - target_depth).abs() * in_crop).sum()
-            / max(depth_targets.num_sparse_points, 1)
-            * config.sparse_depth_reg
-        )
-        loss = loss + sparse_depth_loss
-
-    dense_depth, dense_depth_valid = depth_targets.dense_depth, depth_targets.dense_depth_valid
-    num_dense_valid = depth_targets.num_dense_valid
-    if dense_depth is not None and dense_depth_valid is not None and num_dense_valid is not None:
-        if config.dense_depth_reg > 0.0:
-            if config.batch_size > 1:
-                raise NotImplementedError("Dense depth loss is not implemented for batch_size > 1.")
-            if render_outputs.depth is None:
-                raise RuntimeError("Model did not render depth channel, but dense depth loss is enabled.")
-            cx, cy, cw, ch = crop
-            gt_depth_crop = dense_depth[:, cy : cy + ch, cx : cx + cw]
-            gt_valid_crop = dense_depth_valid[:, cy : cy + ch, cx : cx + cw]
-            pred_dense_depth = render_outputs.depth[..., 0] / torch.clamp(render_outputs.alpha[..., 0], min=1e-6)
-            valid_mask = gt_valid_crop.float()
-            valid_count = valid_mask.sum()
-            # A mean over this crop's valid pixels, weighted by their share of the image's valid pixels.
-            dense_weight = valid_count / num_dense_valid
-            if depth_targets.dense_depth_is_relative:
-                dense_depth_loss = (
-                    _scale_shift_invariant_l1(pred_dense_depth, gt_depth_crop, gt_valid_crop)
-                    * config.dense_depth_reg
-                    * dense_weight
-                )
-            else:
-                dense_depth_loss = (
-                    (torch.abs(pred_dense_depth - gt_depth_crop) * valid_mask).sum()
-                    / valid_count.clamp(min=1.0)
-                    * config.dense_depth_reg
-                    * dense_weight
-                )
-            loss = loss + dense_depth_loss
-
-    loss.backward()
-    return _CropLosses(
-        total=loss.detach(),
-        l1=l1.detach() * crop_weight,
-        ssim=ssim_loss.detach() * crop_weight,
-        sparse_depth=sparse_depth_loss.detach(),
-        dense_depth=dense_depth_loss.detach(),
-    )
-
-
 @dataclass
 class GaussianSplatReconstructionConfig:
     """
@@ -358,19 +179,8 @@ class GaussianSplatReconstructionConfig:
 
     crops_per_image: int = 1
     """
-    Number of crops per side to split each image into during reconstruction, so ``2`` renders four crops.
-    The Gaussians are projected once per image and every crop rasterizes from that projection, skipping
-    tiles outside the crop. Each crop's loss is weighted by its share of the image before its backward, so
-    the per-pixel terms (L1 and depth) sum to the full-image loss and the gradient reaches the shared
-    projection once, as with ``crops_per_image=1``. Three things differ from whole-image training: SSIM is
-    computed per crop with zero padding, so its windows along crop seams do not see the neighbouring crop;
-    the scale-and-shift-invariant dense depth loss fits its scale and shift per crop rather than per image;
-    and rows or columns left over when the image size is not divisible by this count are not supervised.
-    Regularization and the pose penalty are applied once per image rather than once per crop, so their
-    weight relative to the image loss no longer grows with the square of this count.
-    Every crop must be at least 11 pixels on a side, the SSIM window, or training raises.
-    The raster output buffers are still allocated at full image size (openvdb/fvdb-core#800), so it
-    reduces peak memory less than the crop area alone would suggest.
+    Number of crops to use per image during reconstruction. If you're using very large images, you can set this to a value greater than 1
+    to run the forward pass on crops and accumulate gradients. This can help reduce memory usage.
 
     Default: ``1`` (no cropping, use full images).
     """
@@ -603,21 +413,11 @@ class GaussianSplatReconstructionConfig:
     Default: ``16``
     """
 
-    render_backend: Literal["auto", "image_space", "world_space"] = "auto"
+    render_backend: Literal["image_space", "world_space"] = "image_space"
     """
-    Rendering path to use during reconstruction, for training and evaluation alike.
+    Rendering path to use during reconstruction.
 
-    A run uses one backend for every batch; the projection method may still differ between batches when
-    the scene holds several camera models (one model per batch). ``"image_space"`` projects the Gaussians
-    and rasterizes the projections, which feeds the densification statistics; it refuses cameras that need
-    the unscented projection (the distortion camera models under ``projection_method="auto"``), since that
-    projection has no backward pass and their geometry would not train. ``"world_space"`` evaluates the 3D
-    Gaussians along per-pixel rays and differentiates through them directly, at the cost of the
-    densification statistics and of any gradient to the camera matrices. ``"auto"`` picks ``"image_space"``
-    unless the scene has a camera that needs the unscented projection, in which case it picks
-    ``"world_space"`` and logs why.
-
-    Default: ``"auto"``
+    Default: ``"image_space"``
     """
 
     projection_method: Literal["auto", "analytic", "unscented"] = "auto"
@@ -763,6 +563,9 @@ class GaussianSplatReconstruction:
         model = GaussianSplatReconstruction._init_model(config, optimizer_config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
+        render_backend = make_render_backend(config.render_backend)
+        render_backend.validate_scene_cameras(model, train_dataset, config, torch.device(device))
+
         # Initialize optimizer
         max_steps = config.max_epochs * len(train_dataset)
         optimizer = optimizer_config.make_optimizer(model=model, sfm_scene=train_dataset.sfm_scene)
@@ -795,6 +598,7 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
+            render_backend=render_backend,
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -958,6 +762,7 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
+            render_backend=make_render_backend(config.render_backend),
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -977,6 +782,7 @@ class GaussianSplatReconstruction:
         viz_scene: Scene | None,
         log_interval_steps: int,
         viz_update_interval_epochs: float,
+        render_backend: RenderBackend,
         _private: object | None = None,
     ) -> None:
         """
@@ -1018,6 +824,7 @@ class GaussianSplatReconstruction:
         self._pose_adjust_scheduler = pose_adjust_scheduler
         self._start_step = start_step
         self._viz_update_interval_epochs = viz_update_interval_epochs
+        self._render_backend = render_backend
 
         self._sfm_scene = sfm_scene
 
@@ -1061,12 +868,7 @@ class GaussianSplatReconstruction:
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
         self.device: torch.device = model.device
-        # One backend for the whole run, chosen from the config and the scene's cameras, then checked against them.
-        self._render_backend: RenderBackend = resolve_render_backend(self._cfg, self._training_dataset)
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
-        _check_crop_size(
-            self._training_dataset.image_sizes, self._cfg.crops_per_image, self._training_dataset.patch_size
-        )
 
         self._global_step: int = 0
 
@@ -1610,79 +1412,117 @@ class GaussianSplatReconstruction:
 
                 # Progressively use higher spherical harmonic degree as we optimize
                 sh_degree_to_use = min(self._global_step // increase_sh_degree_every_step, self.config.sh_degree)
-                # The crop-independent work (projection, or the full render for the world-space backend)
-                # runs once per view; each crop below renders from it.
-                training_view = self._render_backend.forward_train(
-                    model=self.model,
-                    config=self.config,
-                    world_to_camera_matrices=world_to_cam_mats,
-                    projection_matrices=projection_mats,
-                    camera_models=camera_models,
-                    distortion_coeffs=distortion_coeffs,
-                    image_width=image_width,
-                    image_height=image_height,
-                    sh_degree_to_use=sh_degree_to_use,
-                )
                 # If you have very large images, you can iterate over disjoint crops and accumulate gradients
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
-                #
-                # Every per-crop loss is a mean over the crop's own pixels or depth points, so each is weighted
-                # by the crop's share of the whole before backward. The per-pixel terms then sum to the
-                # full-image loss and the shared backward sees one gradient for the whole image; SSIM differs
-                # along crop seams and leftover rows or columns go unsupervised (see crops_per_image).
-                depth_targets = _DepthTargets(
-                    sparse_depth=sparse_depth,
-                    sparse_depth_uv=sparse_depth_uv,
-                    median_depths=median_depths,
-                    dense_depth=dense_depth_tgt,
-                    dense_depth_valid=dense_depth_valid,
-                    dense_depth_is_relative=self._dense_depth_is_relative,
-                )
-                image_loss = torch.zeros((), device=self.device)
-                l1loss = torch.zeros((), device=self.device)
-                ssimloss = torch.zeros((), device=self.device)
-                depth_loss = torch.zeros((), device=self.device)
-                dense_depth_loss = torch.zeros((), device=self.device)
-                # One random background per view, so every crop is supervised against the same target.
-                background = torch.rand(1, 3, device=self.device) if self.config.random_bkgd else None
-                for pixels, mask_pixels, crop, _ in crop_image_batch(image, mask, self.config.crops_per_image):
-                    # Renders the crop, computes its losses, and runs its backward; the graph dies on return.
-                    crop_losses = _train_crop(
-                        training_view,
-                        crop,
-                        crop_loss_weight(crop, image_height, image_width),
-                        pixels,
-                        mask_pixels,
-                        depth_targets,
-                        self.config,
-                        self.device,
-                        background,
-                    )
-                    image_loss = image_loss + crop_losses.total
-                    l1loss = l1loss + crop_losses.l1
-                    ssimloss = ssimloss + crop_losses.ssim
-                    depth_loss = depth_loss + crop_losses.sparse_depth
-                    dense_depth_loss = dense_depth_loss + crop_losses.dense_depth
+                for pixels, mask_pixels, crop, is_last in crop_image_batch(image, mask, self.config.crops_per_image):
+                    # Actual pixels to compute the loss on, normalized to [0, 1]
+                    pixels: torch.Tensor = pixels.to(device=self.device) / 255.0  # [1, H, W, 3]
 
-                # Regularization does not depend on the crop, so it is applied once per view.
-                view_reg = self.optimizer.regularization_loss()
-                # If you're optimizing poses, regularize the pose parameters so the poses
-                # don't drift too far from the initial values
-                if self.pose_adjust_model is not None and pose_opt_start_step <= self._global_step < pose_opt_stop_step:
-                    assert image_ids is not None
-                    pose_params = self.pose_adjust_model.pose_embeddings(image_ids)
-                    pose_reg = torch.mean(torch.abs(pose_params))
-                    view_reg = view_reg + self.config.pose_opt_reg * pose_reg
-                else:
-                    pose_reg = None
-                if view_reg.requires_grad:
-                    view_reg.backward()
-                loss = image_loss + view_reg.detach()
-                # One backward through the shared per-view work (projection and features, or the world-space
-                # render) with the gradient every crop accumulated, so it runs once however many crops there are.
-                training_view.finish_backward()
-                # Release the view before the next step projects, so two never coexist.
-                del training_view
+                    # Render an image from the gaussian splats
+                    # possibly using a crop of the full image
+                    render_outputs = self._render_backend.forward_train(
+                        model=self.model,
+                        config=self.config,
+                        world_to_camera_matrices=world_to_cam_mats,
+                        projection_matrices=projection_mats,
+                        camera_models=camera_models,
+                        distortion_coeffs=distortion_coeffs,
+                        image_width=image_width,
+                        image_height=image_height,
+                        sh_degree_to_use=sh_degree_to_use,
+                        crop=crop,
+                    )
+                    image = render_outputs.image
+
+                    # If you want to add random background, we'll mix it in here
+                    if self.config.random_bkgd:
+                        bkgd = torch.rand(1, 3, device=self.device)
+                        image = image + bkgd * (1.0 - render_outputs.alpha)
+
+                    if mask_pixels is not None:
+                        # set the ground truth pixel values to match render, thus loss is zero at mask pixels and not updated
+                        mask_pixels = mask_pixels.to(self.device)
+                        pixels[~mask_pixels] = image.detach()[~mask_pixels]
+
+                    # Image losses
+                    l1loss = nnf.l1_loss(image, pixels)
+                    ssimloss = 1.0 - ssim(
+                        image.permute(0, 3, 1, 2).contiguous(),
+                        pixels.permute(0, 3, 1, 2).contiguous(),
+                    )
+                    loss = torch.lerp(l1loss, ssimloss, self.config.ssim_lambda)  # type: ignore
+
+                    # Apply any additional regularization to the model for the given
+                    # optimizer.
+                    loss = loss + self.optimizer.regularization_loss()
+                    # Sparse depth loss
+                    if sparse_depth is not None and sparse_depth_uv is not None and median_depths is not None:
+                        if self.config.batch_size > 1:
+                            raise NotImplementedError("Sparse depth loss is not implemented for batch_size > 1.")
+                        if render_outputs.depth is None:
+                            raise RuntimeError("Model did not render depth channel, but sparse depth loss is enabled.")
+                        if sparse_depth_uv.numel() == 0:
+                            depth_loss = 0.0
+                        else:
+                            depth = render_outputs.depth[..., 0]  # [1, H, W]
+                            depth_uv = depth[:, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0]]  # [B, N]
+                            alpha_uv = render_outputs.alpha[
+                                :, sparse_depth_uv[0, :, 1], sparse_depth_uv[0, :, 0], 0
+                            ]  # [B, N]
+                            pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6)  # [B, N]
+                            pred_depth = pred_depth / median_depths.unsqueeze(1)  # Normalize by median depth
+                            sparse_depth = sparse_depth / median_depths.unsqueeze(1)  # Normalize by median depth
+
+                            depth_loss = nnf.l1_loss(pred_depth, sparse_depth) * self.config.sparse_depth_reg
+                            loss = loss + depth_loss
+                    else:
+                        depth_loss = 0.0
+
+                    # Dense depth loss (from a DepthMapAttribute on the scene).
+                    if dense_depth_tgt is not None and self.config.dense_depth_reg > 0.0:
+                        if self.config.batch_size > 1:
+                            raise NotImplementedError("Dense depth loss is not implemented for batch_size > 1.")
+                        if render_outputs.depth is None:
+                            raise RuntimeError("Model did not render depth channel, but dense depth loss is enabled.")
+                        cx, cy, cw, ch = crop
+                        gt_depth_crop = dense_depth_tgt[:, cy : cy + ch, cx : cx + cw]
+                        gt_valid_crop = dense_depth_valid[:, cy : cy + ch, cx : cx + cw]
+                        pred_dense_depth = render_outputs.depth[..., 0] / torch.clamp(
+                            render_outputs.alpha[..., 0], min=1e-6
+                        )  # [B, h, w]
+                        if self._dense_depth_is_relative:
+                            dense_depth_loss = (
+                                _scale_shift_invariant_l1(pred_dense_depth, gt_depth_crop, gt_valid_crop)
+                                * self.config.dense_depth_reg
+                            )
+                        else:
+                            valid_mask = gt_valid_crop.float()
+                            valid_count = valid_mask.sum().clamp(min=1.0)
+                            dense_depth_loss = (
+                                (torch.abs(pred_dense_depth - gt_depth_crop) * valid_mask).sum()
+                                / valid_count
+                                * self.config.dense_depth_reg
+                            )
+                        loss = loss + dense_depth_loss
+                    else:
+                        dense_depth_loss = 0.0
+
+                    # If you're optimizing poses, regularize the pose parameters so the poses
+                    # don't drift too far from the initial values
+                    if (
+                        self.pose_adjust_model is not None
+                        and pose_opt_start_step <= self._global_step < pose_opt_stop_step
+                    ):
+                        assert image_ids is not None
+                        pose_params = self.pose_adjust_model.pose_embeddings(image_ids)
+                        pose_reg = torch.mean(torch.abs(pose_params))
+                        loss = loss + self.config.pose_opt_reg * pose_reg
+                    else:
+                        pose_reg = None
+
+                    # If we're splitting into crops, accumulate gradients, so pass retain_graph=True
+                    # for every crop but the last one
+                    loss.backward(retain_graph=not is_last)
 
                 # Refine the gaussians via splitting/duplication/pruning
                 if (
@@ -1730,8 +1570,16 @@ class GaussianSplatReconstruction:
                     self._writer.log_metric(self._global_step, f"{log_tag}/loss", loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/l1loss", l1loss.item())
                     self._writer.log_metric(self._global_step, f"{log_tag}/ssimloss", ssimloss.item())
-                    self._writer.log_metric(self._global_step, f"{log_tag}/depth_loss", depth_loss.item())
-                    self._writer.log_metric(self._global_step, f"{log_tag}/dense_depth_loss", dense_depth_loss.item())
+                    self._writer.log_metric(
+                        self._global_step,
+                        f"{log_tag}/depth_loss",
+                        depth_loss if isinstance(depth_loss, float) else depth_loss.item(),
+                    )
+                    self._writer.log_metric(
+                        self._global_step,
+                        f"{log_tag}/dense_depth_loss",
+                        dense_depth_loss if isinstance(dense_depth_loss, float) else dense_depth_loss.item(),
+                    )
                     self._writer.log_metric(self._global_step, f"{log_tag}/num_gaussians", self.model.num_gaussians)
                     self._writer.log_metric(self._global_step, f"{log_tag}/sh_degree", sh_degree_to_use)
                     self._writer.log_metric(self._global_step, f"{log_tag}/mem_allocated", mem_allocated)

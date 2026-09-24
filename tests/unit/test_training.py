@@ -168,9 +168,9 @@ class GaussianSplatReconstructionTests(unittest.TestCase):
         )
 
         with patch(
-            "fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction.resolve_render_backend"
-        ) as resolve_render_backend:
-            resolve_render_backend.return_value.validate_scene_cameras.return_value = None
+            "fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction.make_render_backend"
+        ) as make_render_backend:
+            make_render_backend.return_value.validate_scene_cameras.return_value = None
             runner = frc.radiance_fields.GaussianSplatReconstruction.from_sfm_scene(
                 self.sfm_scene,
                 config=config,

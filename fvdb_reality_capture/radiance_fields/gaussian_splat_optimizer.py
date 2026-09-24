@@ -855,37 +855,37 @@ class GaussianSplatOptimizer(BaseGaussianSplatOptimizer):
         # We use the average norm of the gradients of the projected Gaussians with respect to the
         # loss (accumulated since the last refinement step) to decide which Gaussians to duplicate or split.
 
-        # Only the analytic projection's backward pass fills the 2D gradient accumulators, and only the
-        # image-space views wire them in: world-space rasterization projects without them, and the
-        # unscented projection has no backward. The model holds the tensors zeroed whenever accumulation
-        # is enabled, so an untouched step count, not a missing tensor, is the sign that no view fed them.
-        step_counts = self._model.accumulated_gradient_step_counts
-        grad_norms = self._model.accumulated_mean_2d_gradient_norms
-        if step_counts is None or grad_norms is None or not bool((step_counts > 0).any()):
+        # Guard against None gradient accumulation tensors. This can happen when a projection method
+        # (e.g., Unscented Transform for OpenCV camera models) does not accumulate 2D mean gradients.
+        if (
+            self._model.accumulated_gradient_step_counts is None
+            or self._model.accumulated_mean_2d_gradient_norms is None
+        ):
             if not getattr(self, "_warned_missing_gradient_accumulation", False):
                 self._logger.warning(
-                    "No 2D mean-gradient statistics were accumulated since the last refinement. The render path "
-                    "in use does not produce them: the unscented projection (OpenCV camera models) has no backward "
-                    "pass, and world-space rasterization does not differentiate through the projected means. "
-                    "Gradient-driven duplication and splitting are skipped; splitting on screen-space radius, if "
-                    "enabled, and deletion are unaffected."
+                    "Gradient accumulation data is unavailable (accumulated_gradient_step_counts or "
+                    "accumulated_mean_2d_gradient_norms is None). This is expected when using a projection "
+                    "method that does not support gradient accumulation (e.g., Unscented Transform for "
+                    "OpenCV camera models). Skipping Gaussian insertion for this refinement step."
                 )
                 self._warned_missing_gradient_accumulation = True
-            # With no gradient statistics nothing is "high error"; the radius-based test below still applies.
-            avg_norm_of_projected_mean_gradients = torch.zeros(
-                self._model.num_gaussians, device=self._model.means.device, dtype=self._model.means.dtype
+            device = self._model.means.device
+            N = self._model.num_gaussians
+            return (
+                torch.zeros(N, dtype=torch.bool, device=device),
+                torch.zeros(N, dtype=torch.bool, device=device),
             )
-        else:
-            # model.accumulated_gradient_step_counts is the number of times a Gaussian has been projected
-            # to an image (i.e. included in the loss gradient computation)
-            # model.accumulated_mean_2d_gradient_norms is the sum of norms of the gradients of the
-            # projected Gaussians (dL/dμ2D) since the last refinement step.
-            count = step_counts.clamp_min(1)
-            if self._num_grad_accumulation_steps > 1:
-                # Multiply the 2D gradient count by the number of times we've called backward since the last
-                # zero_grad() to get the correct average if we're calling backward multiple times per iteration.
-                count *= self._num_grad_accumulation_steps
-            avg_norm_of_projected_mean_gradients = grad_norms / count
+
+        # model.accumulated_gradient_step_counts is the number of times a Gaussian has been projected
+        # to an image (i.e. included in the loss gradient computation)
+        # model.accumulated_mean_2d_gradient_norms is the sum of norms of the gradients of the
+        # projected Gaussians (dL/dμ2D) since the last refinement step.
+        count = self._model.accumulated_gradient_step_counts.clamp_min(1)
+        if self._num_grad_accumulation_steps > 1:
+            # Multiply the 2D gradient count by the number of times we've called backward since the last zero_grad()
+            # to get the correct average if we're calling backward multiple times per iteration.
+            count *= self._num_grad_accumulation_steps
+        avg_norm_of_projected_mean_gradients = self._model.accumulated_mean_2d_gradient_norms / count
 
         # If the average norm of 2D projected gradients is high, that Gaussian is likely introducing
         # a lot of error into the reconstruction, and is a candidate for duplication or splitting.
