@@ -16,6 +16,7 @@ from fvdb.types import DeviceIdentifier, cast_check, resolve_device
 
 from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
+    Crop,
     apply_pixel_mask,
     GaussianTileIntersection,
     ProjectedGaussians,
@@ -1493,9 +1494,11 @@ class GaussianSplat3d:
         differentiate through the projected means, so it projects without them and leaves the statistics
         to the image-space views.
         """
-        grad_norms, step_counts, max_radii = (
-            self._projection_accumulators() if accumulate_statistics else (None, None, None)
-        )
+        # The accumulators exist (zeroed) whenever they are enabled, so refinement can read them on every
+        # path; world-space rendering leaves the gradient ones out so its views do not count as samples.
+        grad_norms, step_counts, max_radii = self._projection_accumulators()
+        if not accumulate_statistics:
+            grad_norms, step_counts = None, None
         return project_gaussians(
             self._means,
             self._quats,
@@ -1629,6 +1632,7 @@ class GaussianSplat3d:
         masks: torch.Tensor | None,
         render_mode: GaussianRenderMode,
         world_space: bool,
+        crop: Crop | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All four stages for dense images, in screen space or world space."""
         projected, opacities = self._project_and_opacities(
@@ -1662,9 +1666,10 @@ class GaussianSplat3d:
                 distortion_coeffs=distortion_coeffs,
                 backgrounds=backgrounds,
                 masks=masks,
+                crop=crop,
             )
         return rasterize_screen_space_gaussians(
-            projected, features, opacities, tiles, backgrounds=backgrounds, masks=masks
+            projected, features, opacities, tiles, backgrounds=backgrounds, masks=masks, crop=crop
         )
 
     def _render_sparse(
@@ -2156,8 +2161,8 @@ class GaussianSplat3d:
         pg = projected_gaussians
         projected = pg.projected_gaussians
         width, height = projected.image_width, projected.image_height
-        crop_w = crop_width if crop_width > 0 else width
-        crop_h = crop_height if crop_height > 0 else height
+        crop_w = crop_width if crop_width >= 0 else width
+        crop_h = crop_height if crop_height >= 0 else height
         origin_w = crop_origin_w if crop_origin_w >= 0 else 0
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
@@ -2546,6 +2551,7 @@ class GaussianSplat3d:
         antialias: bool = False,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
+        crop: Crop | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense images by rasterizing directly from world-space 3D Gaussians.
@@ -2617,6 +2623,9 @@ class GaussianSplat3d:
             masks (torch.Tensor | None): Optional per-pixel boolean mask of shape ``(C, H, W)``.
                 ``True`` means render, ``False`` means skip (filled with background).
 
+            crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
+                to render instead of the full image, clipped to the image; tiles outside it are skipped and
+                the output has the clipped size. A crop entirely outside the image raises.
 
         Returns:
             images (torch.Tensor): Rendered images of shape ``(C, H, W, D)``.
@@ -2641,6 +2650,7 @@ class GaussianSplat3d:
             masks,
             render_mode=GaussianRenderMode.FEATURES,
             world_space=True,
+            crop=crop,
         )
 
     def render_depths_from_world(
@@ -2660,6 +2670,7 @@ class GaussianSplat3d:
         antialias: bool = False,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
+        crop: Crop | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense depth images by rasterizing directly from world-space 3D Gaussians.
@@ -2686,6 +2697,7 @@ class GaussianSplat3d:
             masks,
             render_mode=GaussianRenderMode.DEPTH,
             world_space=True,
+            crop=crop,
         )
 
     def sparse_render_images(
@@ -2766,6 +2778,9 @@ class GaussianSplat3d:
                 ``tileW = ceil(image_width / tile_size)``. ``True`` means the tile is rendered,
                 ``False`` means the tile is skipped and its pixels receive the background value
                 with zero alpha.
+            crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
+                to render instead of the full image, clipped to the image; tiles outside it are skipped and
+                the output has the clipped size. A crop entirely outside the image raises.
 
         Returns:
             features (torch.Tensor | JaggedTensor): A tensor of shape ``(C, P, D)`` or a
@@ -3038,6 +3053,7 @@ class GaussianSplat3d:
         antialias: bool = False,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
+        crop: Crop | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense RGBD images by rasterizing directly from world-space 3D Gaussians.
@@ -3064,6 +3080,7 @@ class GaussianSplat3d:
             masks,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
             world_space=True,
+            crop=crop,
         )
 
     def render_num_contributing_gaussians(
@@ -3132,6 +3149,9 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
+            crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
+                to render instead of the full image, clipped to the image; tiles outside it are skipped and
+                the output has the clipped size. A crop entirely outside the image raises.
 
         Returns:
             images (torch.Tensor): A tensor of shape ``(C, H, W, 1)`` where ``C`` is the number of camera views,

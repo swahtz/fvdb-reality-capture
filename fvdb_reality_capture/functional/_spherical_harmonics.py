@@ -40,10 +40,11 @@ def evaluate_gaussian_sh(
 
     Gaussians culled by the projection (zero radii) receive zero features. Differentiable with
     respect to ``sh0``, ``shN``, ``means`` and ``world_to_camera_matrices``. The depth channel is the
-    view-space depth of each Gaussian center. When a gradient is wanted it is recomputed here from
-    ``means`` and ``world_to_camera_matrices``, which is exact because depth is linear in the center and
-    costs one einsum in the backward instead of the projection's full backward kernel (the unscented
-    projection has none).
+    view-space depth of each Gaussian center, computed here from ``means`` and ``world_to_camera_matrices``
+    so that the result is the same function of its inputs under either projection and with or without
+    autograd, and so its backward is an elementwise product rather than the projection's full backward
+    kernel (the unscented projection has none). It equals ``projected.depths`` for every Gaussian the
+    projection kept; the projection zeroes the depth of Gaussians it culled, which are not rasterized.
 
     Args:
         means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
@@ -58,18 +59,15 @@ def evaluate_gaussian_sh(
         features (torch.Tensor): ``[C, N, D]``, ``[C, N, 1]`` or ``[C, N, D + 1]`` depending on ``render_mode``.
     """
     render_mode = GaussianRenderMode(render_mode)
-    depths = projected.depths
-    if (
-        render_mode != GaussianRenderMode.FEATURES
-        and torch.is_grad_enabled()
-        and (means.requires_grad or world_to_camera_matrices.requires_grad)
-    ):
-        # Depth is linear in the center, so this is exact for either projection, and its backward is an
-        # elementwise product and a sum rather than the analytic projection's full backward kernel.
+    if render_mode == GaussianRenderMode.FEATURES:
+        depths = None
+    else:
+        # The view-space z of each center, computed here rather than read from the projection so the
+        # result does not depend on the projection method or on autograd state, and so its backward is
+        # an elementwise product and a sum rather than the analytic projection's full backward kernel.
         rotation_z = world_to_camera_matrices[:, 2, :3]  # [C, 3]
         translation_z = world_to_camera_matrices[:, 2, 3:4]  # [C, 1]
-        depths = (rotation_z.unsqueeze(1) * means.unsqueeze(0)).sum(-1) + translation_z  # [C, N]
-    depths = depths.unsqueeze(-1)
+        depths = ((rotation_z.unsqueeze(1) * means.unsqueeze(0)).sum(-1) + translation_z).unsqueeze(-1)  # [C, N, 1]
     if render_mode == GaussianRenderMode.DEPTH:
         return depths
 

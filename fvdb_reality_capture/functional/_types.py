@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from fvdb import JaggedTensor
@@ -50,6 +50,9 @@ class ProjectedGaussians:
     projection_method: ProjectionMethod
     """The projection method actually used, with :attr:`~fvdb_reality_capture.ProjectionMethod.AUTO` resolved."""
 
+    token: object = field(default_factory=object, repr=False)
+    """Identity of this projection. Tile intersections record it so stale tiles are caught; ``replace`` keeps it."""
+
     @property
     def num_cameras(self) -> int:
         """Number of cameras ``C``."""
@@ -89,6 +92,9 @@ class GaussianTileIntersection:
 
     image_height: int
     """Image height in pixels."""
+
+    projection_token: object = field(repr=False)
+    """The :attr:`ProjectedGaussians.token` of the projection these tiles were intersected for."""
 
     @property
     def num_tiles_w(self) -> int:
@@ -154,6 +160,9 @@ class SparseGaussianTileIntersection:
 
     image_height: int
     """Image height in pixels."""
+
+    projection_token: object = field(repr=False)
+    """The :attr:`ProjectedGaussians.token` of the projection these tiles were intersected for."""
 
     @property
     def num_cameras(self) -> int:

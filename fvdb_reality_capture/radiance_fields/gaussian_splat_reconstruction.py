@@ -112,22 +112,24 @@ def _scale_shift_invariant_l1(
 _SSIM_WINDOW = 11
 
 
-def _check_crop_size(image_sizes: np.ndarray, crops_per_image: int) -> None:
-    """Raise unless every crop of every training image covers at least the SSIM window.
+def _check_crop_size(image_sizes: np.ndarray, crops_per_image: int, patch_size: int | None = None) -> None:
+    """Raise unless every crop of every delivered training image covers at least the SSIM window.
 
     Args:
         image_sizes (np.ndarray): ``(I, 2)`` array of ``(height, width)`` per training image.
         crops_per_image (int): Crops per side, as in :attr:`GaussianSplatReconstructionConfig.crops_per_image`.
+        patch_size (int | None): The dataset's random patch size, when it delivers patches rather than images.
     """
     if crops_per_image < 1:
         raise ValueError(f"crops_per_image must be at least 1, got {crops_per_image}")
     if len(image_sizes) == 0:
         return
-    smallest = int(image_sizes.min()) // crops_per_image
+    delivered = int(image_sizes.min()) if patch_size is None else min(int(image_sizes.min()), patch_size)
+    smallest = delivered // crops_per_image
     if smallest < _SSIM_WINDOW:
         raise ValueError(
-            f"crops_per_image={crops_per_image} gives crops as small as {smallest} pixels on the smallest training "
-            f"image ({int(image_sizes.min())} pixels); each crop must cover the {_SSIM_WINDOW}-pixel SSIM window"
+            f"crops_per_image={crops_per_image} gives crops as small as {smallest} pixels on the smallest delivered "
+            f"training image ({delivered} pixels); each crop must cover the {_SSIM_WINDOW}-pixel SSIM window"
         )
 
 
@@ -599,17 +601,18 @@ class GaussianSplatReconstructionConfig:
     Default: ``16``
     """
 
-    render_backend: Literal["image_space", "world_space"] = "image_space"
+    render_backend: Literal["auto", "image_space", "world_space"] = "auto"
     """
     Rendering path to use during reconstruction, for training and evaluation alike.
 
-    ``"image_space"`` projects the Gaussians and rasterizes the projections. Batches whose camera needs the
+    ``"auto"`` chooses per camera batch. Batches whose camera has an analytic projection are projected and
+    rasterized in image space, which feeds the densification statistics. Batches whose camera needs the
     unscented projection (the distortion camera models under ``projection_method="auto"``), which has no
-    backward pass, are rendered in world space instead so their geometry still receives a gradient; the
-    other batches keep image space and keep feeding the densification statistics, which only the analytic
-    projection produces. ``"world_space"`` evaluates the 3D Gaussians along per-pixel rays for every batch.
+    backward pass, are rendered in world space so their geometry still receives a gradient. ``"image_space"``
+    uses the image-space path for every batch and refuses cameras it cannot train; ``"world_space"``
+    evaluates the 3D Gaussians along per-pixel rays for every batch.
 
-    Default: ``"image_space"``
+    Default: ``"auto"``
     """
 
     projection_method: Literal["auto", "analytic", "unscented"] = "auto"
@@ -1061,7 +1064,9 @@ class GaussianSplatReconstruction:
 
         self.device: torch.device = model.device
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
-        _check_crop_size(self._training_dataset.image_sizes, self._cfg.crops_per_image)
+        _check_crop_size(
+            self._training_dataset.image_sizes, self._cfg.crops_per_image, self._training_dataset.patch_size
+        )
 
         self._global_step: int = 0
 

@@ -3,7 +3,7 @@
 #
 import logging
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Iterator, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol
 
 import numpy as np
 import torch
@@ -46,7 +46,7 @@ class RenderOutputs:
     depth: torch.Tensor | None = None
 
 
-RenderBackendName = Literal["image_space", "world_space"]
+RenderBackendName = Literal["auto", "image_space", "world_space"]
 
 
 class TrainingView(Protocol):
@@ -127,16 +127,30 @@ class _ProjectedTrainingView:
         self._shared.backward()
 
 
-class _RenderedTrainingView:
-    """World-space view: the full image is rendered once, each crop is a slice of a copy of it."""
+class _WorldSpaceTrainingView:
+    """World-space view: each crop is rendered directly, since there is no projection stage to share.
 
-    def __init__(self, rendered: torch.Tensor, alpha: torch.Tensor, num_channels: int) -> None:
-        self._shared = _SharedWork([rendered, alpha])
-        self._rendered, self._alpha = self._shared.leaves
+    The world-space rasterizer differentiates through the 3D parameters, so each crop's backward reaches
+    the model on its own and no full-image render is kept alive across crops. The camera matrices are the
+    one input the crops share (they carry the pose-adjustment graph), so the crops render from detached
+    copies of them and :meth:`finish_backward` propagates their accumulated gradient once.
+    """
+
+    def __init__(
+        self, render: "Callable[..., tuple[torch.Tensor, torch.Tensor]]", arguments: dict[str, Any], num_channels: int
+    ) -> None:
+        self._shared = _SharedWork([arguments["world_to_camera_matrices"], arguments["projection_matrices"]])
+        world_to_camera_matrices, projection_matrices = self._shared.leaves
+        self._arguments = {
+            **arguments,
+            "world_to_camera_matrices": world_to_camera_matrices,
+            "projection_matrices": projection_matrices,
+        }
+        self._render = render
         self._num_channels = num_channels
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
-        rendered, alpha = apply_crop(self._rendered, self._alpha, crop)
+        rendered, alpha = self._render(**self._arguments, crop=crop)
         return _split_render_outputs(rendered, alpha, self._num_channels)
 
     def finish_backward(self) -> None:
@@ -194,8 +208,8 @@ def _distinct_camera_batches(
 ) -> Iterator[tuple[CameraModel, torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]]:
     """One single-image batch per distinct camera model in ``dataset``, for probing a render path.
 
-    Yields ``(camera_model, world_to_camera, projection, distortion_coeffs, width, height)``, with the
-    distortion coefficients already ``None`` for camera models that take none.
+    Yields ``(camera_model, world_to_camera, projection, distortion_coeffs, width, height)`` with the packed
+    ``[1, 12]`` distortion coefficients and the image size the dataset delivers.
     """
     seen: set[int] = set()
     for scene_idx in dataset.indices:
@@ -212,75 +226,49 @@ def _distinct_camera_batches(
             camera_meta.distortion_coeffs if camera_meta.distortion_coeffs.size != 0 else np.zeros((12,), np.float32)
         )
         distortion_coeffs = torch.from_numpy(coeffs).float().unsqueeze(0).to(device)
-        camera_model_enum = CameraModel(camera_model)
-        distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model_enum, distortion_coeffs, device)
+        # The dataset delivers patches no larger than patch_size, so the probe renders at that size.
+        width, height = _delivered_image_size(dataset, camera_meta.width, camera_meta.height)
         yield (
-            camera_model_enum,
+            CameraModel(camera_model),
             world_to_camera.contiguous(),
             projection.contiguous(),
-            distortion_coeffs_arg,
-            camera_meta.width,
-            camera_meta.height,
+            distortion_coeffs,
+            width,
+            height,
         )
 
 
-def _probe_projection(
+def _delivered_image_size(dataset: SfmDataset, width: int, height: int) -> tuple[int, int]:
+    """The size of the images ``dataset`` actually delivers for a camera of ``width`` by ``height``."""
+    patch_size = getattr(dataset, "patch_size", None)
+    if patch_size is None:
+        return width, height
+    return min(width, patch_size), min(height, patch_size)
+
+
+def _render_arguments(
     model: GaussianSplat3d,
     config: "GaussianSplatReconstructionConfig",
     camera_model: CameraModel,
-    world_to_camera: torch.Tensor,
-    projection: torch.Tensor,
-    distortion_coeffs: torch.Tensor | None,
-    width: int,
-    height: int,
-) -> None:
-    projection_function = (
-        model.project_gaussians_for_images_and_depths
-        if _needs_depth_render(config)
-        else model.project_gaussians_for_images
-    )
-    projection_function(
-        world_to_camera_matrices=world_to_camera,
-        projection_matrices=projection,
-        image_width=width,
-        image_height=height,
+    world_to_camera_matrices: torch.Tensor,
+    projection_matrices: torch.Tensor,
+    distortion_coeffs: torch.Tensor,
+    image_width: int,
+    image_height: int,
+    sh_degree_to_use: int,
+) -> dict[str, Any]:
+    """The keyword arguments every :class:`GaussianSplat3d` projection and render call takes for one camera batch."""
+    return dict(
+        world_to_camera_matrices=world_to_camera_matrices,
+        projection_matrices=projection_matrices,
+        image_width=image_width,
+        image_height=image_height,
         near=config.near_plane,
         far=config.far_plane,
         camera_model=camera_model,
         projection_method=projection_method_from_config(config.projection_method),
-        distortion_coeffs=distortion_coeffs,
-        sh_degree_to_use=0,
-        min_radius_2d=config.min_radius_2d,
-        eps_2d=config.eps_2d,
-        antialias=config.antialias,
-    )
-
-
-def _probe_world_space_render(
-    model: GaussianSplat3d,
-    config: "GaussianSplatReconstructionConfig",
-    camera_model: CameraModel,
-    world_to_camera: torch.Tensor,
-    projection: torch.Tensor,
-    distortion_coeffs: torch.Tensor | None,
-    width: int,
-    height: int,
-) -> None:
-    render_function = (
-        model.render_images_and_depths_from_world if _needs_depth_render(config) else model.render_images_from_world
-    )
-    render_function(
-        world_to_camera_matrices=world_to_camera,
-        projection_matrices=projection,
-        image_width=width,
-        image_height=height,
-        near=config.near_plane,
-        far=config.far_plane,
-        camera_model=camera_model,
-        projection_method=projection_method_from_config(config.projection_method),
-        distortion_coeffs=distortion_coeffs,
-        sh_degree_to_use=0,
-        tile_size=config.tile_size,
+        distortion_coeffs=_distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device),
+        sh_degree_to_use=sh_degree_to_use,
         min_radius_2d=config.min_radius_2d,
         eps_2d=config.eps_2d,
         antialias=config.antialias,
@@ -402,7 +390,132 @@ class RenderBackend(Protocol):
         ...
 
 
-class ImageSpaceRenderBackend:
+class _ModelRenderBackend:
+    """
+    Shared forward path of the backends that render a :class:`GaussianSplat3d`.
+
+    Validation checks the camera batching, lets the subclass judge the scene's camera models, then
+    probes one image per camera model through :meth:`_probe`. The forward passes resolve the batch's
+    camera model once and hand the shared render arguments to :meth:`_train_view` and
+    :meth:`_eval_render`, which are the only methods a backend has to provide.
+    """
+
+    def validate_scene_cameras(
+        self,
+        model: GaussianSplat3d,
+        dataset: SfmDataset,
+        config: "GaussianSplatReconstructionConfig",
+        device: torch.device,
+    ) -> None:
+        """
+        Check the scene's cameras and probe one image per camera model through this backend's path.
+
+        Args:
+            model (GaussianSplat3d): Gaussian splat model used for the probe render.
+            dataset (SfmDataset): Dataset whose cameras should be validated.
+            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
+            device (torch.device): Device on which validation probes should run.
+        """
+        _check_camera_batching(dataset, config)
+        self._validate_camera_models(dataset, config)
+        with torch.no_grad():
+            for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
+                dataset, device
+            ):
+                arguments = _render_arguments(
+                    model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height, 0
+                )
+                self._probe(model, config, camera_model, arguments)
+
+    def forward_train(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        camera_models: torch.Tensor,
+        distortion_coeffs: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        sh_degree_to_use: int,
+    ) -> TrainingView:
+        """Do the per-image training work for this batch; see :class:`RenderBackend`."""
+        camera_model = _camera_model_from_batch(camera_models)
+        arguments = _render_arguments(
+            model,
+            config,
+            camera_model,
+            world_to_camera_matrices,
+            projection_matrices,
+            distortion_coeffs,
+            image_width,
+            image_height,
+            sh_degree_to_use,
+        )
+        return self._train_view(model, config, camera_model, arguments)
+
+    def forward_eval(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        camera_models: torch.Tensor,
+        distortion_coeffs: torch.Tensor,
+        image_width: int,
+        image_height: int,
+        sh_degree_to_use: int,
+    ) -> RenderOutputs:
+        """Render a full evaluation image for this batch; see :class:`RenderBackend`."""
+        camera_model = _camera_model_from_batch(camera_models)
+        arguments = _render_arguments(
+            model,
+            config,
+            camera_model,
+            world_to_camera_matrices,
+            projection_matrices,
+            distortion_coeffs,
+            image_width,
+            image_height,
+            sh_degree_to_use,
+        )
+        return self._eval_render(model, config, camera_model, arguments)
+
+    def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
+        """Raise or warn about camera models this backend cannot fully train."""
+
+    def _probe(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        camera_model: CameraModel,
+        arguments: dict[str, Any],
+    ) -> None:
+        """Run one image of ``camera_model`` through this backend's path under ``torch.no_grad``."""
+        raise NotImplementedError
+
+    def _train_view(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        camera_model: CameraModel,
+        arguments: dict[str, Any],
+    ) -> TrainingView:
+        """The training view for one batch, given the resolved camera model and shared render arguments."""
+        raise NotImplementedError
+
+    def _eval_render(
+        self,
+        model: GaussianSplat3d,
+        config: "GaussianSplatReconstructionConfig",
+        camera_model: CameraModel,
+        arguments: dict[str, Any],
+    ) -> RenderOutputs:
+        """The evaluation render for one batch, given the resolved camera model and shared render arguments."""
+        raise NotImplementedError
+
+
+class ImageSpaceRenderBackend(_ModelRenderBackend):
     """
     Backend that projects Gaussians in image space before rasterization.
 
@@ -411,394 +524,79 @@ class ImageSpaceRenderBackend:
     rendering path and for renderers that need projected-gaussian intermediates during training.
 
     It cannot train cameras that need the unscented projection, which has no backward pass;
-    :class:`RoutedRenderBackend` sends those batches to :class:`WorldSpaceRenderBackend` instead.
+    :class:`RoutedRenderBackend` (``render_backend="auto"``) sends those batches to
+    :class:`WorldSpaceRenderBackend` instead.
     """
 
-    def validate_scene_cameras(
-        self,
-        model: GaussianSplat3d,
-        dataset: SfmDataset,
-        config: "GaussianSplatReconstructionConfig",
-        device: torch.device,
-    ) -> None:
-        """
-        Probe the scene cameras to ensure image-space rendering supports them.
-
-        Cameras that resolve to the unscented projection are rejected: rasterizing from that projection
-        would train features and opacities while the Gaussian geometry received no gradient at all.
-
-        Args:
-            model (GaussianSplat3d): Gaussian splat model used for the probe render.
-            dataset (SfmDataset): Dataset whose cameras should be validated.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            device (torch.device): Device on which validation probes should run.
-        """
-        _check_camera_batching(dataset, config)
+    def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
+        # Rasterizing from the unscented projection would train features and opacities while the geometry
+        # received no gradient at all, so those cameras are rejected rather than half-trained.
         forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
             raise ValueError(
                 _forward_only_explanation(forward_only, config)
-                + ' Use render_backend="world_space", or the routed backend that "image_space" selects, which '
-                "differentiates through the 3D parameters directly for those cameras."
+                + ' Use render_backend="auto", which renders those cameras in world space, or "world_space".'
             )
-        with torch.no_grad():
-            for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
-                dataset, device
-            ):
-                _probe_projection(
-                    model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height
-                )
 
-    def forward_train(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> TrainingView:
-        """
-        Project the Gaussians into the target cameras once; the returned view rasterizes each crop.
+    def _probe(self, model, config, camera_model, arguments) -> None:
+        self._project(model, config, arguments)
 
-        If depth regularization is enabled, the projection also carries the depth channel. The view
-        keeps the tile intersection and the opacities of that projection, so rendering several crops
-        repeats only the rasterization.
-
-        Args:
-            model (GaussianSplat3d): Gaussian splat model to render.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            world_to_camera_matrices (torch.Tensor): Batch of world-to-camera matrices.
-            projection_matrices (torch.Tensor): Batch of camera intrinsics matrices.
-            camera_models (torch.Tensor): Batch of encoded :class:`fvdb_reality_capture.CameraModel` values.
-            distortion_coeffs (torch.Tensor): Batch of packed distortion coefficients.
-            image_width (int): Full image width in pixels before cropping.
-            image_height (int): Full image height in pixels before cropping.
-            sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-
-        Returns:
-            TrainingView: Renders any crop of this view from the shared projection.
-        """
-        return self._train_view(
-            model,
-            config,
-            _camera_model_from_batch(camera_models),
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
-        )
-
-    def _train_view(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        camera_model: CameraModel,
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> TrainingView:
-        """The body of :meth:`forward_train` for an already resolved camera model."""
-        projection_method = projection_method_from_config(config.projection_method)
-        distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
+    @staticmethod
+    def _project(
+        model: GaussianSplat3d, config: "GaussianSplatReconstructionConfig", arguments: dict[str, Any]
+    ) -> ProjectedGaussianSplats:
         projection_function = (
             model.project_gaussians_for_images_and_depths
             if _needs_depth_render(config)
             else model.project_gaussians_for_images
         )
-        projected_gaussians = projection_function(
-            world_to_camera_matrices=world_to_camera_matrices,
-            projection_matrices=projection_matrices,
-            image_width=image_width,
-            image_height=image_height,
-            near=config.near_plane,
-            far=config.far_plane,
-            camera_model=camera_model,
-            projection_method=projection_method,
-            distortion_coeffs=distortion_coeffs_arg,
-            sh_degree_to_use=sh_degree_to_use,
-            min_radius_2d=config.min_radius_2d,
-            eps_2d=config.eps_2d,
-            antialias=config.antialias,
-        )
-        return _ProjectedTrainingView(projected_gaussians, config.tile_size, model.num_channels)
+        return projection_function(**arguments)
 
-    def forward_eval(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> RenderOutputs:
-        """
-        Render a full evaluation image using image-space projection and rasterization.
+    def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
+        # Project once; the view keeps the tile intersection and opacities, so each crop only rasterizes.
+        return _ProjectedTrainingView(self._project(model, config, arguments), config.tile_size, model.num_channels)
 
-        Args:
-            model (GaussianSplat3d): Gaussian splat model to render.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            world_to_camera_matrices (torch.Tensor): Batch of world-to-camera matrices.
-            projection_matrices (torch.Tensor): Batch of camera intrinsics matrices.
-            camera_models (torch.Tensor): Batch of encoded :class:`fvdb_reality_capture.CameraModel` values.
-            distortion_coeffs (torch.Tensor): Batch of packed distortion coefficients.
-            image_width (int): Output image width in pixels.
-            image_height (int): Output image height in pixels.
-            sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-
-        Returns:
-            RenderOutputs: The rendered image and alpha image, plus depth when provided by the
-            selected render path.
-        """
-        return self._eval_render(
-            model,
-            config,
-            _camera_model_from_batch(camera_models),
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
-        )
-
-    def _eval_render(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        camera_model: CameraModel,
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> RenderOutputs:
-        """The body of :meth:`forward_eval` for an already resolved camera model."""
-        distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
-        image, alpha = model.render_images(
-            world_to_camera_matrices=world_to_camera_matrices,
-            projection_matrices=projection_matrices,
-            image_width=image_width,
-            image_height=image_height,
-            near=config.near_plane,
-            far=config.far_plane,
-            camera_model=camera_model,
-            projection_method=projection_method_from_config(config.projection_method),
-            distortion_coeffs=distortion_coeffs_arg,
-            sh_degree_to_use=sh_degree_to_use,
-            tile_size=config.tile_size,
-            min_radius_2d=config.min_radius_2d,
-            eps_2d=config.eps_2d,
-            antialias=config.antialias,
-        )
+    def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:
+        image, alpha = model.render_images(**arguments, tile_size=config.tile_size)
         return RenderOutputs(image=image, alpha=alpha)
 
 
-class WorldSpaceRenderBackend:
+class WorldSpaceRenderBackend(_ModelRenderBackend):
     """
     Backend that renders directly from world-space Gaussians.
 
     This backend uses the world-space FVDB rendering APIs directly. It avoids the explicit
     projected-gaussian intermediate used by the image-space backend while preserving the same
-    high-level interface expected by :class:`GaussianSplatReconstruction`.
+    high-level interface expected by :class:`GaussianSplatReconstruction`. Each training crop is
+    rendered on its own, since there is no per-view work to share between crops.
     """
 
-    def validate_scene_cameras(
-        self,
-        model: GaussianSplat3d,
-        dataset: SfmDataset,
-        config: "GaussianSplatReconstructionConfig",
-        device: torch.device,
-    ) -> None:
-        """
-        Probe the scene cameras to ensure world-space rendering supports them.
-
-        Args:
-            model (GaussianSplat3d): Gaussian splat model used for the probe render.
-            dataset (SfmDataset): Dataset whose cameras should be validated.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            device (torch.device): Device on which validation probes should run.
-        """
-        _check_camera_batching(dataset, config)
+    def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
         note = _pose_optimization_note([CameraModel(m) for m in sorted(set(dataset.camera_models.tolist()))], config)
         if note:
             _logger.warning(note.strip())
-        with torch.no_grad():
-            for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
-                dataset, device
-            ):
-                _probe_world_space_render(
-                    model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height
-                )
 
-    def forward_train(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> TrainingView:
-        """
-        Render the full training view directly from world-space Gaussians; the returned view slices crops.
-
-        The world-space renderer has no projection stage to share between crops, so the full image
-        is rendered once and each crop is a slice of it, which keeps the crop-based training loop
-        uniform across backends.
-
-        Args:
-            model (GaussianSplat3d): Gaussian splat model to render.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            world_to_camera_matrices (torch.Tensor): Batch of world-to-camera matrices.
-            projection_matrices (torch.Tensor): Batch of camera intrinsics matrices.
-            camera_models (torch.Tensor): Batch of encoded :class:`fvdb_reality_capture.CameraModel` values.
-            distortion_coeffs (torch.Tensor): Batch of packed distortion coefficients.
-            image_width (int): Full image width in pixels before cropping.
-            image_height (int): Full image height in pixels before cropping.
-            sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-
-        Returns:
-            TrainingView: Slices any crop out of the rendered view.
-        """
-        return self._train_view(
-            model,
-            config,
-            _camera_model_from_batch(camera_models),
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
-        )
-
-    def _train_view(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        camera_model: CameraModel,
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> TrainingView:
-        """The body of :meth:`forward_train` for an already resolved camera model."""
-        distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
-        render_function = (
+    @staticmethod
+    def _render_function(model: GaussianSplat3d, config: "GaussianSplatReconstructionConfig"):
+        return (
             model.render_images_and_depths_from_world if _needs_depth_render(config) else model.render_images_from_world
         )
-        rendered, alpha = render_function(
-            world_to_camera_matrices=world_to_camera_matrices,
-            projection_matrices=projection_matrices,
-            image_width=image_width,
-            image_height=image_height,
-            near=config.near_plane,
-            far=config.far_plane,
-            camera_model=camera_model,
-            projection_method=projection_method_from_config(config.projection_method),
-            distortion_coeffs=distortion_coeffs_arg,
-            sh_degree_to_use=sh_degree_to_use,
-            tile_size=config.tile_size,
-            min_radius_2d=config.min_radius_2d,
-            eps_2d=config.eps_2d,
-            antialias=config.antialias,
-        )
-        return _RenderedTrainingView(rendered, alpha, model.num_channels)
 
-    def forward_eval(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> RenderOutputs:
-        """
-        Render a full evaluation image directly from world-space Gaussians.
+    def _probe(self, model, config, camera_model, arguments) -> None:
+        self._render_function(model, config)(**arguments, tile_size=config.tile_size)
 
-        Args:
-            model (GaussianSplat3d): Gaussian splat model to render.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            world_to_camera_matrices (torch.Tensor): Batch of world-to-camera matrices.
-            projection_matrices (torch.Tensor): Batch of camera intrinsics matrices.
-            camera_models (torch.Tensor): Batch of encoded :class:`fvdb_reality_capture.CameraModel` values.
-            distortion_coeffs (torch.Tensor): Batch of packed distortion coefficients.
-            image_width (int): Output image width in pixels.
-            image_height (int): Output image height in pixels.
-            sh_degree_to_use (int): Maximum spherical harmonics degree to render.
-
-        Returns:
-            RenderOutputs: The rendered image and alpha image, plus depth when provided by the
-            selected render path.
-        """
-        return self._eval_render(
-            model,
-            config,
-            _camera_model_from_batch(camera_models),
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
+    def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
+        render = self._render_function(model, config)
+        return _WorldSpaceTrainingView(
+            lambda **kwargs: render(**kwargs, tile_size=config.tile_size), arguments, model.num_channels
         )
 
-    def _eval_render(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        camera_model: CameraModel,
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> RenderOutputs:
-        """The body of :meth:`forward_eval` for an already resolved camera model."""
-        distortion_coeffs_arg = _distortion_coeffs_for_batch(camera_model, distortion_coeffs, model.device)
-        image, alpha = model.render_images_from_world(
-            world_to_camera_matrices=world_to_camera_matrices,
-            projection_matrices=projection_matrices,
-            image_width=image_width,
-            image_height=image_height,
-            near=config.near_plane,
-            far=config.far_plane,
-            camera_model=camera_model,
-            projection_method=projection_method_from_config(config.projection_method),
-            distortion_coeffs=distortion_coeffs_arg,
-            sh_degree_to_use=sh_degree_to_use,
-            tile_size=config.tile_size,
-            min_radius_2d=config.min_radius_2d,
-            eps_2d=config.eps_2d,
-            antialias=config.antialias,
-        )
+    def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:
+        image, alpha = model.render_images_from_world(**arguments, tile_size=config.tile_size)
         return RenderOutputs(image=image, alpha=alpha)
 
 
-class RoutedRenderBackend:
+class RoutedRenderBackend(_ModelRenderBackend):
     """
     Image space where it can train, world space where it must, chosen per camera batch.
 
@@ -808,7 +606,7 @@ class RoutedRenderBackend:
     same choice is made for training and evaluation, so the renderer being measured is the one being
     optimized. Because it is per batch, a scene that mixes pinhole and distortion cameras keeps its
     pinhole views in image space, and they keep feeding the densification statistics, which only the
-    analytic projection's backward produces.
+    analytic projection's backward produces. This is what ``render_backend="auto"`` selects.
     """
 
     def __init__(self) -> None:
@@ -817,32 +615,15 @@ class RoutedRenderBackend:
 
     def _backend_for(
         self, camera_model: CameraModel, config: "GaussianSplatReconstructionConfig"
-    ) -> ImageSpaceRenderBackend | WorldSpaceRenderBackend:
+    ) -> _ModelRenderBackend:
         projection_method = projection_method_from_config(config.projection_method)
         if resolve_projection_method(camera_model, projection_method) == ProjectionMethod.UNSCENTED:
             return self._world_space
         return self._image_space
 
-    def validate_scene_cameras(
-        self,
-        model: GaussianSplat3d,
-        dataset: SfmDataset,
-        config: "GaussianSplatReconstructionConfig",
-        device: torch.device,
-    ) -> None:
-        """
-        Probe every camera model in the scene through the path its batches will take.
-
-        Camera models that will render in world space are logged once, since views from them add
-        nothing to the densification statistics.
-
-        Args:
-            model (GaussianSplat3d): Gaussian splat model used for the probe render.
-            dataset (SfmDataset): Dataset whose cameras should be validated.
-            config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
-            device (torch.device): Device on which validation probes should run.
-        """
-        _check_camera_batching(dataset, config)
+    def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
+        # Camera models that will render in world space are logged once, since views from them add
+        # nothing to the densification statistics.
         forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
             _logger.warning(
@@ -853,77 +634,27 @@ class RoutedRenderBackend:
                 + _pose_optimization_note(forward_only, config)
                 + " Undistort the images to train every view in image space."
             )
-        with torch.no_grad():
-            for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
-                dataset, device
-            ):
-                probe = (
-                    _probe_projection
-                    if self._backend_for(camera_model, config) is self._image_space
-                    else _probe_world_space_render
-                )
-                probe(model, config, camera_model, world_to_camera, projection, distortion_coeffs, width, height)
 
-    def forward_train(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> TrainingView:
-        """Per-image training work with the backend chosen for this batch's camera; see :class:`RenderBackend`."""
-        camera_model = _camera_model_from_batch(camera_models)
-        return self._backend_for(camera_model, config)._train_view(
-            model,
-            config,
-            camera_model,
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
-        )
+    def _probe(self, model, config, camera_model, arguments) -> None:
+        self._backend_for(camera_model, config)._probe(model, config, camera_model, arguments)
 
-    def forward_eval(
-        self,
-        model: GaussianSplat3d,
-        config: "GaussianSplatReconstructionConfig",
-        world_to_camera_matrices: torch.Tensor,
-        projection_matrices: torch.Tensor,
-        camera_models: torch.Tensor,
-        distortion_coeffs: torch.Tensor,
-        image_width: int,
-        image_height: int,
-        sh_degree_to_use: int,
-    ) -> RenderOutputs:
-        """Render an evaluation image with the backend chosen for this batch's camera; see :class:`RenderBackend`."""
-        camera_model = _camera_model_from_batch(camera_models)
-        return self._backend_for(camera_model, config)._eval_render(
-            model,
-            config,
-            camera_model,
-            world_to_camera_matrices,
-            projection_matrices,
-            distortion_coeffs,
-            image_width,
-            image_height,
-            sh_degree_to_use,
-        )
+    def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
+        return self._backend_for(camera_model, config)._train_view(model, config, camera_model, arguments)
+
+    def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:
+        return self._backend_for(camera_model, config)._eval_render(model, config, camera_model, arguments)
 
 
 def make_render_backend(name: RenderBackendName) -> RenderBackend:
     """Return the backend a :class:`GaussianSplatReconstructionConfig` ``render_backend`` value names.
 
-    ``"image_space"`` is the routed backend: image space for cameras it can train, world space for the rest.
+    ``"auto"`` routes per camera batch: image space for cameras it can train, world space for the rest.
+    ``"image_space"`` and ``"world_space"`` are the pure backends.
     """
-    if name == "image_space":
+    if name == "auto":
         return RoutedRenderBackend()
+    if name == "image_space":
+        return ImageSpaceRenderBackend()
     if name == "world_space":
         return WorldSpaceRenderBackend()
     raise ValueError(f"Unsupported render_backend {name}")

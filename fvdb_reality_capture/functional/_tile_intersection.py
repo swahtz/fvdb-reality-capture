@@ -25,9 +25,12 @@ def check_tiles_match(
 ) -> None:
     """Raise if ``tiles`` were not intersected for ``projected``.
 
-    Tile intersections index the kernels by camera and image tile. Stale ones, from a projection of a
-    different camera batch or image size, would read out of range and produce garbage or a device assert
-    rather than a Python error, so the stages check this up front.
+    Tile intersections index the kernels by camera, image tile and Gaussian. Stale ones, from a projection
+    of a different camera batch or image size, or of the same cameras before an optimizer step or a
+    refinement moved, added or removed Gaussians, would read out of range or blend the wrong Gaussians
+    rather than raise, so the stages check this up front. Every projection carries a token that its tile
+    intersections record; ``dataclasses.replace`` on the projection keeps the token, so tiles stay valid
+    for views that swap in detached copies of the same projection.
 
     Args:
         tiles (GaussianTileIntersection | SparseGaussianTileIntersection): The tile intersection to check.
@@ -44,6 +47,10 @@ def check_tiles_match(
         num_cameras = tiles.pixels_to_render.num_tensors
     if num_cameras != projected.num_cameras:
         raise ValueError(f"tiles cover {num_cameras} cameras but the projection has {projected.num_cameras}")
+    if tiles.projection_token is not projected.token:
+        raise ValueError(
+            "tiles were intersected for a different projection; recompute them after the Gaussians or cameras change"
+        )
 
 
 def _culling_inputs(
@@ -94,6 +101,7 @@ def intersect_gaussian_tiles(
         tile_size=tile_size,
         image_width=projected.image_width,
         image_height=projected.image_height,
+        projection_token=projected.token,
     )
 
 
@@ -224,4 +232,5 @@ def intersect_gaussian_tiles_sparse(
         tile_size=tile_size,
         image_width=projected.image_width,
         image_height=projected.image_height,
+        projection_token=projected.token,
     )
