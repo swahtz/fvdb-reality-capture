@@ -73,11 +73,14 @@ class ProjectedGaussianSplats:
         far_plane: float,
         min_radius_2d: float,
         sh_degree_to_use: int,
-        opacities: torch.Tensor | None = None,
+        opacities: torch.Tensor,
         _private: Any = None,
     ) -> None:
         """
         Private constructor. Use :meth:`GaussianSplat3d.project_gaussians_for_images` or similar methods to create instances.
+
+        ``opacities`` are the per-camera opacities of ``projected``, ``(C, N)``, computed by the projection
+        helper alongside the features so the projection is a consistent snapshot of the model.
         """
         if _private is not self.__PRIVATE__:
             raise ValueError(
@@ -92,9 +95,7 @@ class ProjectedGaussianSplats:
         self._far_plane = far_plane
         self._min_radius_2d = min_radius_2d
         self._sh_degree_to_use = sh_degree_to_use
-        # Computed here, alongside the features, so the projection is a consistent snapshot of the model.
-        # Deriving them at render time would mix the logits as they are then with the geometry as it was.
-        self._opacities = opacities if opacities is not None else compute_gaussian_opacities(logit_opacities, projected)
+        self._opacities = opacities
 
     @property
     def projected_gaussians(self) -> ProjectedGaussians:
@@ -318,8 +319,6 @@ class ProjectedGaussianSplats:
 
         Returns:
             sh_degree_to_use (int): The spherical harmonic degree used during projection.
-            opacities (torch.Tensor | None): The per-camera opacities of ``projected``, ``(C, N)``, when the caller
-                already computed them; derived from ``logit_opacities`` and ``projected`` otherwise.
         """
         return self._sh_degree_to_use
 
@@ -1488,13 +1487,16 @@ class GaussianSplat3d:
         eps_2d: float,
         antialias: bool,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> ProjectedGaussians:
         """Stage 1 for this model's Gaussians.
 
-        With ``accumulate_statistics`` the enabled densification accumulators are wired into the projection,
-        so its backward records the 2D mean gradients, step counts and radii. World-space rasterization
-        does not differentiate through the projected means, so it projects with the gradient accumulators
-        left out (its views must not count as samples) and records only the radii, from the forward.
+        ``accumulate_statistics`` wires the enabled gradient accumulators into the projection, so a
+        backward through the projected means records the 2D mean gradients and step counts (and, in the
+        kernel, the radii). ``record_radii`` records each Gaussian's largest projected radius into the
+        radius accumulator here, in the forward; training passes it, since the kernel only records in a
+        backward that reaches the projected means, which world-space rasterization, frozen geometry and
+        the unscented projection never produce. Taking the maximum twice is harmless, so both may be on.
         """
         # The accumulators exist (zeroed) whenever they are enabled, so refinement can read them on every
         # path; world-space rendering leaves the gradient ones out so its views do not count as samples.
@@ -1521,12 +1523,7 @@ class GaussianSplat3d:
             accumulated_gradient_step_counts=step_counts,
             accumulated_max_2d_radii=max_radii,
         )
-        kernel_records_radii = grad_norms is not None and step_counts is not None and projected.is_differentiable
-        if max_radii is not None and not kernel_records_radii and torch.is_grad_enabled():
-            # The analytic kernel records radii only in its backward, inside the gradient-statistics pass.
-            # A projection that pass will not see (gradient accumulators withheld or disabled, or the
-            # unscented projection) records them here instead, in a training forward only, so evaluation
-            # and validation probes leave the accumulators alone as they do in image space.
+        if record_radii and max_radii is not None:
             with torch.no_grad():
                 max_radii.copy_(torch.maximum(max_radii, projected.radii.amax(dim=(0, 2)).to(max_radii.dtype)))
         return projected
@@ -1546,6 +1543,7 @@ class GaussianSplat3d:
         eps_2d: float,
         antialias: bool,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> tuple[ProjectedGaussians, torch.Tensor]:
         """Stage 1 plus the per-camera opacities every later stage takes, computed once."""
         projected = self._project(
@@ -1562,6 +1560,7 @@ class GaussianSplat3d:
             eps_2d=eps_2d,
             antialias=antialias,
             accumulate_statistics=accumulate_statistics,
+            record_radii=record_radii,
         )
         return projected, compute_gaussian_opacities(self._logit_opacities, projected)
 
@@ -1594,11 +1593,11 @@ class GaussianSplat3d:
         sh_degree_to_use: int,
         render_mode: GaussianRenderMode,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """Stages 1 and 2, bundled for later rendering with :meth:`render_from_projected_gaussians`.
 
-        ``accumulate_statistics`` is passed to :meth:`_project`; the world-space training path turns it
-        off, since its views must not count as densification samples.
+        ``accumulate_statistics`` and ``record_radii`` are passed to :meth:`_project`.
         """
         projected, opacities = self._project_and_opacities(
             world_to_camera_matrices=world_to_camera_matrices,
@@ -1614,6 +1613,7 @@ class GaussianSplat3d:
             eps_2d=eps_2d,
             antialias=antialias,
             accumulate_statistics=accumulate_statistics,
+            record_radii=record_radii,
         )
         render_quantities = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         return ProjectedGaussianSplats(
@@ -1651,6 +1651,7 @@ class GaussianSplat3d:
         render_mode: GaussianRenderMode,
         world_space: bool,
         crop: Crop | None = None,
+        crop_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All four stages for dense images, in screen space or world space."""
         projected, opacities = self._project_and_opacities(
@@ -1685,9 +1686,17 @@ class GaussianSplat3d:
                 backgrounds=backgrounds,
                 masks=masks,
                 crop=crop,
+                crop_masks=crop_masks,
             )
         return rasterize_screen_space_gaussians(
-            projected, features, opacities, tiles, backgrounds=backgrounds, masks=masks, crop=crop
+            projected,
+            features,
+            opacities,
+            tiles,
+            backgrounds=backgrounds,
+            masks=masks,
+            crop=crop,
+            crop_masks=crop_masks,
         )
 
     def _render_sparse(
@@ -1758,6 +1767,7 @@ class GaussianSplat3d:
         eps_2d: float = 0.3,
         antialias: bool = False,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering depth images in those planes.
@@ -1827,10 +1837,15 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
-                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+            accumulate_statistics (bool): Whether a backward through this projection's means records the
+                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
                 Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
+                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
+            record_radii (bool): Record each Gaussian's largest projected radius into
+                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
+                that reaches the projected means, so a training forward passes ``True`` to cover world-space
+                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
+                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1853,6 +1868,7 @@ class GaussianSplat3d:
             sh_degree_to_use=-1,
             render_mode=GaussianRenderMode.DEPTH,
             accumulate_statistics=accumulate_statistics,
+            record_radii=record_radii,
         )
 
     def project_gaussians_for_images(
@@ -1871,6 +1887,7 @@ class GaussianSplat3d:
         eps_2d: float = 0.3,
         antialias: bool = False,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images in those planes.
@@ -1940,10 +1957,15 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
-                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+            accumulate_statistics (bool): Whether a backward through this projection's means records the
+                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
                 Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
+                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
+            record_radii (bool): Record each Gaussian's largest projected radius into
+                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
+                that reaches the projected means, so a training forward passes ``True`` to cover world-space
+                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
+                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1966,6 +1988,7 @@ class GaussianSplat3d:
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES,
             accumulate_statistics=accumulate_statistics,
+            record_radii=record_radii,
         )
 
     def project_gaussians_for_images_and_depths(
@@ -1984,6 +2007,7 @@ class GaussianSplat3d:
         eps_2d: float = 0.3,
         antialias: bool = False,
         accumulate_statistics: bool = True,
+        record_radii: bool = False,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images with depths
@@ -2062,10 +2086,15 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
-            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
-                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+            accumulate_statistics (bool): Whether a backward through this projection's means records the
+                2D mean-gradient statistics (:attr:`accumulate_mean_2d_gradients`), and with them the radii.
                 Pass ``False`` for a projection whose render will not differentiate through the projected
-                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
+                means, as world-space rasterization does not, so its views do not count as samples. Default ``True``.
+            record_radii (bool): Record each Gaussian's largest projected radius into
+                :attr:`accumulate_max_2d_radii` now, in the forward. The kernel records radii only in a backward
+                that reaches the projected means, so a training forward passes ``True`` to cover world-space
+                rendering, frozen geometry and the unscented projection; renders for viewing or evaluation leave
+                it ``False`` and never touch the accumulators. Default ``False``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -2088,6 +2117,7 @@ class GaussianSplat3d:
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
             accumulate_statistics=accumulate_statistics,
+            record_radii=record_radii,
         )
 
     def render_from_projected_gaussians(
@@ -2561,6 +2591,7 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
         crop: Crop | None = None,
+        crop_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense images by rasterizing directly from world-space 3D Gaussians.
@@ -2635,6 +2666,8 @@ class GaussianSplat3d:
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
                 the output has the clipped size; a crop entirely outside the image gives an empty render.
+            crop_masks (torch.Tensor | None): Optional per-pixel boolean mask in crop coordinates, of the crop's
+                requested or clipped size, as an alternative to the image-coordinate ``masks`` when a crop is given.
 
         Returns:
             images (torch.Tensor): Rendered images of shape ``(C, H, W, D)``.
@@ -2660,6 +2693,7 @@ class GaussianSplat3d:
             render_mode=GaussianRenderMode.FEATURES,
             world_space=True,
             crop=crop,
+            crop_masks=crop_masks,
         )
 
     def render_depths_from_world(
@@ -2680,6 +2714,7 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
         crop: Crop | None = None,
+        crop_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense depth images by rasterizing directly from world-space 3D Gaussians.
@@ -2707,6 +2742,7 @@ class GaussianSplat3d:
             render_mode=GaussianRenderMode.DEPTH,
             world_space=True,
             crop=crop,
+            crop_masks=crop_masks,
         )
 
     def sparse_render_images(
@@ -2790,6 +2826,8 @@ class GaussianSplat3d:
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
                 the output has the clipped size; a crop entirely outside the image gives an empty render.
+            crop_masks (torch.Tensor | None): Optional per-pixel boolean mask in crop coordinates, of the crop's
+                requested or clipped size, as an alternative to the image-coordinate ``masks`` when a crop is given.
 
         Returns:
             features (torch.Tensor | JaggedTensor): A tensor of shape ``(C, P, D)`` or a
@@ -3063,6 +3101,7 @@ class GaussianSplat3d:
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
         crop: Crop | None = None,
+        crop_masks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Render dense RGBD images by rasterizing directly from world-space 3D Gaussians.
@@ -3090,6 +3129,7 @@ class GaussianSplat3d:
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
             world_space=True,
             crop=crop,
+            crop_masks=crop_masks,
         )
 
     def render_num_contributing_gaussians(
@@ -3161,6 +3201,8 @@ class GaussianSplat3d:
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
                 the output has the clipped size; a crop entirely outside the image gives an empty render.
+            crop_masks (torch.Tensor | None): Optional per-pixel boolean mask in crop coordinates, of the crop's
+                requested or clipped size, as an alternative to the image-coordinate ``masks`` when a crop is given.
 
         Returns:
             images (torch.Tensor): A tensor of shape ``(C, H, W, 1)`` where ``C`` is the number of camera views,

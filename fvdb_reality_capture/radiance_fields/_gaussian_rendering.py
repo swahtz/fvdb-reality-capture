@@ -415,18 +415,19 @@ def _project_for_training(
     arguments: dict[str, Any],
     accumulate_statistics: bool = True,
 ) -> ProjectedGaussianSplats:
-    """Project one camera batch, with the depth channel when a depth term is on.
+    """Project one camera batch for a training step, with the depth channel when a depth term is on.
 
-    ``accumulate_statistics`` wires the gradient accumulators into the projection; the world-space path
-    turns it off so its views do not count as samples (with antialiasing on, the opacity gradient would
-    otherwise reach the analytic projection's backward and bump the step counts). Radii are recorded either way.
+    Radii are recorded in the forward for every training projection, since the kernel records them only
+    in a backward that reaches the projected means. ``accumulate_statistics`` wires the gradient
+    accumulators in; the world-space path turns it off so its views do not count as samples (with
+    antialiasing on, the opacity gradient would otherwise reach the analytic backward and bump the step counts).
     """
     projection_function = (
         model.project_gaussians_for_images_and_depths
         if _needs_depth_render(config)
         else model.project_gaussians_for_images
     )
-    return projection_function(**arguments, accumulate_statistics=accumulate_statistics)
+    return projection_function(**arguments, accumulate_statistics=accumulate_statistics, record_radii=True)
 
 
 class _ModelRenderBackend:

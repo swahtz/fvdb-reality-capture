@@ -814,18 +814,33 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         radii = model.accumulated_max_2d_radii
         self.assertIsNotNone(radii)
         self.assertGreater(int(radii.max()), 0)
-        # Evaluation and probes run without grad and leave the accumulators alone, as image space does.
+        # Renders that are not training forwards leave the accumulators alone whatever the autograd state,
+        # as image space does: evaluation, probes, and a viewer rendering with grad enabled.
         radii_before = radii.clone()
         with torch.no_grad():
             model.render_images_from_world(self.w2c, self.K, self.W, self.H, 0.01, 1e10, antialias=True)
+        model.render_images_from_world(self.w2c, self.K, self.W, self.H, 0.01, 1e10, antialias=True)
+        model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
         self.assertTrue(torch.equal(model.accumulated_max_2d_radii, radii_before))
-        # The unscented projection never reaches the kernel's gradient pass, so a training forward records
-        # its radii here too.
+        # A training forward records radii explicitly, which is what covers the cases the kernel never
+        # reaches: the unscented projection, and frozen geometry (no backward through the means).
         model.reset_accumulated_gradient_state()
         model.project_gaussians_for_images(
-            self.w2c, self.K, self.W, self.H, 0.01, 1e10, projection_method=ProjectionMethod.UNSCENTED
+            self.w2c,
+            self.K,
+            self.W,
+            self.H,
+            0.01,
+            1e10,
+            projection_method=ProjectionMethod.UNSCENTED,
+            record_radii=True,
         )
         self.assertGreater(int(model.accumulated_max_2d_radii.max()), 0)
+        frozen = self._model(self._params(requires_grad=False))
+        frozen.accumulate_max_2d_radii = True
+        frozen_view = self._forward_train(ImageSpaceRenderBackend(), frozen, GaussianSplatReconstructionConfig())
+        frozen_view.finish_backward()
+        self.assertGreater(int(frozen.accumulated_max_2d_radii.max()), 0)
         # A crop mask the size of the image at a nonzero origin is read in crop coordinates, since crop_masks
         # is a separate argument from the image-coordinate masks.
         pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
