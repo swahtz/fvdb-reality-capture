@@ -46,3 +46,24 @@ def crop_image_batch(
         assert (x2 - x1) == patch_w and (y2 - y1) == patch_h
         is_last = patch_id == (patches.shape[0] - 1)
         yield image_patch, mask_patch, crop, is_last
+
+
+def crop_loss_weight(crop: tuple[int, int, int, int], image_height: int, image_width: int) -> float:
+    """
+    The share of an image's pixels that a crop covers.
+
+    Per-crop losses are means over the crop's own pixels. Weighting each by this share before backward makes
+    the per-pixel losses of an image's crops sum to the full-image loss, so their gradient (and the
+    densification statistics it feeds) is the same whether the image is rendered whole or in crops. SSIM is
+    not per pixel; computed per crop it differs from the whole-image value along crop seams.
+
+    Args:
+        crop (tuple[int, int, int, int]): The crop as ``(x, y, w, h)``, as yielded by :func:`crop_image_batch`.
+        image_height (int): Height of the full image in pixels.
+        image_width (int): Width of the full image in pixels.
+
+    Returns:
+        weight (float): ``w * h / (image_width * image_height)``.
+    """
+    _, _, w, h = crop
+    return float(w * h) / float(image_width * image_height)

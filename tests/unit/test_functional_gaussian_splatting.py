@@ -8,6 +8,9 @@ against itself across the dense, sparse, cropped and world-space paths.
 """
 
 import unittest
+import weakref
+from dataclasses import astuple
+from unittest import mock
 
 import numpy as np
 import torch
@@ -16,6 +19,21 @@ from fvdb.utils.tests import get_fvdb_test_data_path
 
 import fvdb_reality_capture.functional as F
 from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3d, ProjectionMethod
+from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
+    ImageSpaceRenderBackend,
+    WorldSpaceRenderBackend,
+    _ProjectedTrainingView,
+    _WorldSpaceTrainingView,
+    make_render_backend,
+    resolve_render_backend,
+)
+from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch, crop_loss_weight
+from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import (
+    GaussianSplatReconstructionConfig,
+    _check_crop_size,
+    _DepthTargets,
+    _train_crop,
+)
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
@@ -634,8 +652,198 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         good_mask = torch.ones(self.C, 10, 10, dtype=torch.bool, device=self.device)
         images, _ = model.render_from_projected_gaussians(pg, masks=good_mask, **outside)
         self.assertEqual(tuple(images.shape), (self.C, 10, 10, 3))
+
+    def test_empty_selection(self):
+        params = self._params()
+        means, quats, log_scales, logit_opacities, sh0, shN = params
+        projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        opacities = F.compute_gaussian_opacities(logit_opacities, projected)
+        features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
+        empty = JaggedTensor([torch.empty(0, 2, dtype=torch.int64, device=self.device) for _ in range(self.C)])
+        sparse_tiles = F.intersect_gaussian_tiles_sparse(empty, projected, opacities)
+        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, opacities, sparse_tiles)
+        self.assertEqual(tuple(rendered.jdata.shape), (0, 3))
+        self.assertEqual(tuple(alphas.jdata.shape), (0, 1))
+        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
+        self.assertEqual(counts.jdata.numel(), 0)
+
+
+class TestRenderBackends(FunctionalPipelineTestCase):
+    """The training backends do the crop-independent work once per view."""
+
+    def _camera_batch(self, camera_model: CameraModel = CameraModel.PINHOLE):
+        camera_models = torch.full((self.C,), int(camera_model), dtype=torch.int32)
+        distortion_coeffs = torch.zeros(self.C, 12, device=self.device)
+        return camera_models, distortion_coeffs
+
+    def _forward_train(self, backend, model, config, camera_model: CameraModel = CameraModel.PINHOLE):
+        camera_models, distortion_coeffs = self._camera_batch(camera_model)
+        return backend.forward_train(
+            model=model,
+            config=config,
+            world_to_camera_matrices=self.w2c,
+            projection_matrices=self.K,
+            camera_models=camera_models,
+            distortion_coeffs=distortion_coeffs,
+            image_width=self.W,
+            image_height=self.H,
+            sh_degree_to_use=self.sh_degree,
+        )
+
+    def _assert_crops_are_slices(self, view):
+        full = view.render_crop((0, 0, self.W, self.H))
+        self.assertEqual(tuple(full.image.shape), (self.C, self.H, self.W, 3))
+        gt = torch.zeros(self.C, self.H, self.W, 3)
+        for _, _, crop, _ in crop_image_batch(gt, None, 2):
+            ox, oy, w, h = crop
+            out = view.render_crop(crop)
+            torch.testing.assert_close(out.image, full.image[:, oy : oy + h, ox : ox + w], atol=1e-5, rtol=1e-5)
+            torch.testing.assert_close(out.alpha, full.alpha[:, oy : oy + h, ox : ox + w], atol=1e-5, rtol=1e-5)
+
+    def test_image_space_view_projects_once_and_renders_every_crop_from_it(self):
+        model = self._model(self._params())
+        with (
+            mock.patch.object(
+                model, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+            ) as project,
+            mock.patch(
+                "fvdb_reality_capture.radiance_fields.gaussian_splatting.intersect_gaussian_tiles",
+                wraps=F.intersect_gaussian_tiles,
+            ) as intersect,
+        ):
+            view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
+            self._assert_crops_are_slices(view)
+        # Projection and tile intersection each ran once for the whole view, however many crops.
+        self.assertEqual(project.call_count, 1)
+        self.assertEqual(intersect.call_count, 1)
+        self.assertIsInstance(view, _ProjectedTrainingView)
+
+    def _train_one_view(self, crops: int) -> tuple[GaussianSplat3d, list[torch.Tensor]]:
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        model.accumulate_mean_2d_gradients = True
+        view = self._forward_train(ImageSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
+        gt = torch.zeros(self.C, self.H, self.W, 3)
+        for _, _, crop, _ in crop_image_batch(gt, None, crops):
+            out = view.render_crop(crop)
+            # Per-pixel mean losses per crop, weighted by the crop's share of the image as the training loop
+            # does, so the crops add up to exactly the full-image mean loss. SSIM is left out on purpose: its
+            # windows see zero padding at crop seams, so it is not crop-additive.
+            weight = crop_loss_weight(crop, self.H, self.W)
+            ((out.image.square().mean() + out.alpha.mean()) * weight).backward()
+        # Nothing reaches the model until the shared backward runs once.
+        self.assertTrue(all(p.grad is None for p in params))
+        view.finish_backward()
+        return model, params
+
+    def test_crops_share_one_projection_backward_and_one_densification_sample(self):
+        whole_model, whole = self._train_one_view(crops=1)
+        cropped_model, cropped = self._train_one_view(crops=2)
+        for p_whole, p_cropped in zip(whole, cropped):
+            self.assertIsNotNone(p_whole.grad)
+            # The crop path splits the atomicAdd raster backward into four launches and adds their
+            # partial sums, so agreement is up to that summation order (a handful of elements at ~1e-4).
+            torch.testing.assert_close(p_cropped.grad, p_whole.grad, atol=1e-3, rtol=1e-3)
+        # The projection backward ran once per view in both cases, over the whole image's gradient, so
+        # the densification statistics agree. The kernel counts camera-Gaussian pairs, hence <= C.
+        self.assertTrue(
+            torch.equal(cropped_model.accumulated_gradient_step_counts, whole_model.accumulated_gradient_step_counts)
+        )
+        self.assertEqual(int(whole_model.accumulated_gradient_step_counts.max()), self.C)
+        self.assertGreater(float(whole_model.accumulated_mean_2d_gradient_norms.sum()), 0.0)
+        torch.testing.assert_close(
+            cropped_model.accumulated_mean_2d_gradient_norms,
+            whole_model.accumulated_mean_2d_gradient_norms,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+    def test_world_space_view_renders_each_crop_directly(self):
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        w2c = self.w2c.clone().requires_grad_(True)  # stands in for pose-adjusted cameras
+        with mock.patch.object(
+            GaussianSplat3d, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+        ) as project:
+            camera_models, distortion_coeffs = self._camera_batch(CameraModel.PINHOLE)
+            view = WorldSpaceRenderBackend().forward_train(
+                model=model,
+                config=GaussianSplatReconstructionConfig(),
+                world_to_camera_matrices=w2c,
+                projection_matrices=self.K,
+                camera_models=camera_models,
+                distortion_coeffs=distortion_coeffs,
+                image_width=self.W,
+                image_height=self.H,
+                sh_degree_to_use=self.sh_degree,
+            )
+            self.assertIsInstance(view, _WorldSpaceTrainingView)
+            # The projection, features and tiles are computed once; every crop rasterizes from them and
+            # equals the slice of the full render.
+            self.assertEqual(project.call_count, 1)
+            self._assert_crops_are_slices(view)
+            self.assertEqual(project.call_count, 1)
+            gt = torch.zeros(self.C, self.H, self.W, 3)
+            for _, _, crop, _ in crop_image_batch(gt, None, 2):
+                view.render_crop(crop).image.sum().backward()
+                # The world-space rasterizer reaches the 3D parameters directly, crop by crop.
+                self.assertGreater(float(params[0].grad.abs().max()), 0.0)
+        # Features and camera matrices are shared by the crops, so their gradients arrive once, at the end.
+        self.assertIsNone(w2c.grad)
+        self.assertIsNone(params[4].grad)
+        view.finish_backward()
+        self.assertIsNotNone(w2c.grad)
+        self.assertIsNotNone(params[4].grad)
+
+    def test_world_space_training_keeps_the_refinement_accumulators_allocated(self):
+        # Refinement reads the radius accumulator on every path, so world space must allocate it (zeroed)
+        # even though it wires only the image-space projections into the gradient statistics.
+        model = self._model(self._params(requires_grad=True))
+        model.accumulate_mean_2d_gradients = True
+        model.accumulate_max_2d_radii = True
+        # With antialiasing the opacity gradient reaches the analytic projection's backward, which would
+        # bump the step counts if the world-space projection wired the accumulators in.
+        view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig(antialias=True))
+        view.render_crop((0, 0, self.W, self.H)).image.sum().backward()
+        view.finish_backward()
+        # The gradient statistics stay untouched, so world-space views never count as samples...
+        for accumulator in (model.accumulated_mean_2d_gradient_norms, model.accumulated_gradient_step_counts):
+            self.assertIsNotNone(accumulator)
+            self.assertEqual(int(accumulator.abs().sum()), 0)
+        # ... while the radii are recorded from the projection, so radius-based refinement still works.
+        radii = model.accumulated_max_2d_radii
+        self.assertIsNotNone(radii)
+        self.assertGreater(int(radii.max()), 0)
+        # Renders that are not training forwards leave the accumulators alone whatever the autograd state,
+        # as image space does: evaluation, probes, and a viewer rendering with grad enabled.
+        radii_before = radii.clone()
+        with torch.no_grad():
+            model.render_images_from_world(self.w2c, self.K, self.W, self.H, 0.01, 1e10, antialias=True)
+        model.render_images_from_world(self.w2c, self.K, self.W, self.H, 0.01, 1e10, antialias=True)
+        model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        self.assertTrue(torch.equal(model.accumulated_max_2d_radii, radii_before))
+        # A training forward records radii explicitly, which is what covers the cases the kernel never
+        # reaches: the unscented projection, and frozen geometry (no backward through the means).
+        model.reset_accumulated_gradient_state()
+        model.project_gaussians_for_images(
+            self.w2c,
+            self.K,
+            self.W,
+            self.H,
+            0.01,
+            1e10,
+            projection_method=ProjectionMethod.UNSCENTED,
+            record_radii=True,
+        )
+        self.assertGreater(int(model.accumulated_max_2d_radii.max()), 0)
+        frozen = self._model(self._params(requires_grad=False))
+        frozen.accumulate_max_2d_radii = True
+        frozen_view = self._forward_train(ImageSpaceRenderBackend(), frozen, GaussianSplatReconstructionConfig())
+        frozen_view.finish_backward()
+        self.assertGreater(int(frozen.accumulated_max_2d_radii.max()), 0)
         # A crop mask the size of the image at a nonzero origin is read in crop coordinates, since crop_masks
         # is a separate argument from the image-coordinate masks.
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
         crop_mask = torch.zeros(self.C, self.H, self.W, dtype=torch.bool, device=self.device)
         crop_mask[:, :20, :20] = True
         shifted, _ = F.rasterize_screen_space_gaussians(
@@ -656,19 +864,164 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         torch.testing.assert_close(shifted[:, :20, :20], plain[:, :20, :20])
         self.assertEqual(float(shifted[:, 20:].detach().abs().max()), 0.0)
 
-    def test_empty_selection(self):
+    def test_crops_must_cover_the_ssim_window(self):
+        sizes = np.array([[420, 648], [64, 96]])
+        _check_crop_size(sizes, 1)
+        _check_crop_size(sizes, 5)  # 64 // 5 = 12
+        with self.assertRaisesRegex(ValueError, "SSIM window"):
+            _check_crop_size(sizes, 6)  # 64 // 6 = 10
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            _check_crop_size(sizes, 0)
+        # A dataset that delivers patches is judged by the patch size, not the image size.
+        with self.assertRaisesRegex(ValueError, "SSIM window"):
+            _check_crop_size(sizes, 2, patch_size=20)
+
+    def test_training_a_crop_releases_its_graph_and_the_view_releases_its_copies(self):
+        # Image space: the view holds detached copies of the projection and features, plus their gradients.
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        config = GaussianSplatReconstructionConfig()
+        view = self._forward_train(ImageSpaceRenderBackend(), model, config)
+        copy = weakref.ref(view._features)
+        gt = torch.zeros(self.C, self.H, self.W, 3, dtype=torch.uint8)
+        for pixels, mask_pixels, crop, _ in crop_image_batch(gt, None, 2):
+            losses = _train_crop(
+                view,
+                crop,
+                crop_loss_weight(crop, self.H, self.W),
+                pixels,
+                mask_pixels,
+                _DepthTargets(),
+                config,
+                self.device,
+            )
+            self.assertFalse(any(term.requires_grad for term in astuple(losses)))
+        # The crops accumulated into the copy; the shared backward hands that gradient on and drops it.
+        self.assertIsNotNone(view._features.grad)
+        view.finish_backward()
+        self.assertIsNone(view._features.grad)
+        self.assertGreater(float(params[0].grad.abs().max()), 0.0)
+        # Nothing outside the view holds a crop graph, so the copy dies with the view, before the next step.
+        del view
+        self.assertIsNone(copy())
+        # A loss kept alive past its backward would hold the copy through its AccumulateGrad node.
+        view = self._forward_train(ImageSpaceRenderBackend(), model, config)
+        copy = weakref.ref(view._features)
+        held = view.render_crop((0, 0, self.W, self.H)).image.sum()
+        held.backward()
+        view.finish_backward()
+        del view
+        self.assertIsNotNone(copy())
+        del held
+        self.assertIsNone(copy())
+
+    def test_auto_resolves_to_one_backend_for_the_run(self):
+        module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
+        config = GaussianSplatReconstructionConfig()
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
+        mixed = mock.MagicMock(
+            camera_models=np.array([int(CameraModel.PINHOLE), int(CameraModel.OPENCV_RADTAN_5)]), indices=[]
+        )
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            self.assertIsInstance(resolve_render_backend(config, pinhole), ImageSpaceRenderBackend)
+        # Any camera that needs the unscented projection sends the whole run to world space, with a log
+        # that names the camera, the lost densification statistics and (poses being optimized) the
+        # missing camera gradient.
+        for scene in (opencv, mixed):
+            with self.assertLogs(module_logger, level="WARNING") as logs:
+                self.assertIsInstance(resolve_render_backend(config, scene), WorldSpaceRenderBackend)
+            self.assertIn("OPENCV_RADTAN_5", logs.output[0])
+            self.assertIn("world space", logs.output[0])
+            self.assertIn("densification", logs.output[0].lower())
+            self.assertIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING") as logs:
+            resolve_render_backend(GaussianSplatReconstructionConfig(optimize_camera_poses=False), opencv)
+        self.assertNotIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING"):
+            self.assertIsInstance(
+                resolve_render_backend(GaussianSplatReconstructionConfig(projection_method="unscented"), pinhole),
+                WorldSpaceRenderBackend,
+            )
+        # Explicit names pass through untouched; "auto" alone cannot be built without a scene.
+        self.assertIsInstance(
+            resolve_render_backend(GaussianSplatReconstructionConfig(render_backend="world_space"), pinhole),
+            WorldSpaceRenderBackend,
+        )
+        self.assertIsInstance(make_render_backend("image_space"), ImageSpaceRenderBackend)
+        with self.assertRaisesRegex(ValueError, "resolve_render_backend"):
+            make_render_backend("auto")
+
+    def test_pure_backends_validate_the_scene_they_are_given(self):
+        model = self._model(self._params())
+        module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
+        config = GaussianSplatReconstructionConfig()
+        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        # Image space refuses cameras whose geometry it cannot train, and points at world space.
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            ImageSpaceRenderBackend().validate_scene_cameras(model, opencv, config, self.device)
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            ImageSpaceRenderBackend().validate_scene_cameras(
+                model, pinhole, GaussianSplatReconstructionConfig(projection_method="unscented"), self.device
+            )
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            ImageSpaceRenderBackend().validate_scene_cameras(model, pinhole, config, self.device)
+        # World space accepts every camera but says what pose optimization loses there.
+        with self.assertLogs(module_logger, level="WARNING") as logs:
+            WorldSpaceRenderBackend().validate_scene_cameras(model, opencv, config, self.device)
+        self.assertIn("pose optimization", logs.output[0].lower())
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            WorldSpaceRenderBackend().validate_scene_cameras(
+                model, opencv, GaussianSplatReconstructionConfig(optimize_camera_poses=False), self.device
+            )
+
+    def test_stale_tiles_are_rejected_and_precomputed_tiles_are_accepted(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
         projected = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
         opacities = F.compute_gaussian_opacities(logit_opacities, projected)
         features = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected)
-        empty = JaggedTensor([torch.empty(0, 2, dtype=torch.int64, device=self.device) for _ in range(self.C)])
-        sparse_tiles = F.intersect_gaussian_tiles_sparse(empty, projected, opacities)
-        rendered, alphas = F.rasterize_screen_space_gaussians_sparse(projected, features, opacities, sparse_tiles)
-        self.assertEqual(tuple(rendered.jdata.shape), (0, 3))
-        self.assertEqual(tuple(alphas.jdata.shape), (0, 1))
-        counts, _ = F.rasterize_num_contributing_gaussians_sparse(projected, opacities, sparse_tiles)
-        self.assertEqual(counts.jdata.numel(), 0)
+        tiles = F.intersect_gaussian_tiles(projected, opacities)
+        # Tiles from a different image size or camera count would index the kernels out of range.
+        smaller = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W // 2, self.H // 2)
+        smaller_opacities = F.compute_gaussian_opacities(logit_opacities, smaller)
+        with self.assertRaisesRegex(ValueError, "intersected for"):
+            F.rasterize_screen_space_gaussians(smaller, features, smaller_opacities, tiles)
+        with self.assertRaisesRegex(ValueError, "intersected for"):
+            F.rasterize_num_contributing_gaussians(smaller, smaller_opacities, tiles)
+        # Re-projecting the same cameras (after an optimizer step or a refinement, say) makes new tiles
+        # necessary even though the sizes agree, because the ids may point at Gaussians that moved or went.
+        again = F.project_gaussians(means, quats, log_scales, self.w2c, self.K, self.W, self.H)
+        with self.assertRaisesRegex(ValueError, "different projection"):
+            F.rasterize_screen_space_gaussians(again, features, opacities, tiles)
+        # Detached copies made with replace() keep the projection's identity, as the training view relies on.
+        from dataclasses import replace
+
+        F.rasterize_screen_space_gaussians(
+            replace(projected, means2d=projected.means2d.detach()), features, opacities, tiles
+        )
+        one_camera = F.project_gaussians(means, quats, log_scales, self.w2c[:1], self.K[:1], self.W, self.H)
+        with self.assertRaisesRegex(ValueError, "cameras"):
+            F.rasterize_screen_space_gaussians(
+                one_camera, features[:1], F.compute_gaussian_opacities(logit_opacities, one_camera), tiles
+            )
+        # The class method takes precomputed tiles for repeated crops and renders the same pixels with them.
+        model = self._model(params)
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        pg_tiles = pg.tile_intersection(16)
+        crop = dict(crop_width=40, crop_height=30, crop_origin_w=5, crop_origin_h=7)
+        without, _ = model.render_from_projected_gaussians(pg, **crop)
+        with_tiles, _ = model.render_from_projected_gaussians(pg, tiles=pg_tiles, **crop)
+        torch.testing.assert_close(with_tiles, without)
+        # Only negative sizes mean "full image"; zero is a malformed crop.
+        with self.assertRaisesRegex(ValueError, "positive"):
+            model.render_from_projected_gaussians(pg, crop_width=0, crop_height=30)
+        # The tile size comes from the tiles when they are given; an explicit size that disagrees is refused.
+        with_eight, _ = model.render_from_projected_gaussians(pg, tiles=pg.tile_intersection(8), **crop)
+        torch.testing.assert_close(with_eight, without, atol=1e-5, rtol=1e-5)
+        with self.assertRaisesRegex(ValueError, "tile_size"):
+            model.render_from_projected_gaussians(pg, tiles=pg_tiles, tile_size=8, **crop)
 
 
 if __name__ == "__main__":
