@@ -36,6 +36,7 @@ from ._projection import (
 from ._rasterization import (
     Crop,
     apply_crop,
+    apply_pixel_mask,
     pad_crop,
     pixel_mask_to_tile_mask,
     rasterize_screen_space_gaussians,
@@ -81,6 +82,7 @@ __all__ = [
     "Crop",
     "validate_crop",
     "apply_crop",
+    "apply_pixel_mask",
     "pad_crop",
     # Analysis
     "rasterize_num_contributing_gaussians",

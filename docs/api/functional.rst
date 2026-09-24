@@ -95,7 +95,7 @@ Stage 3: Tile Intersection
 
 .. autofunction:: check_tiles_match
 
-.. py:function:: as_pixel_jagged(pixels_to_render)
+.. py:function:: as_pixel_jagged(value)
 
    ``fvdb.functional.as_pixel_jagged``, re-exported so the sparse pipeline here applies the same
    pixel-selection checks as fvdb's own sparse kernels. Normalizes a ``[C, P, 2]`` tensor or a
@@ -121,6 +121,7 @@ Stage 4: Rasterization
 .. autofunction:: validate_crop
 
 .. autofunction:: apply_crop
+.. autofunction:: apply_pixel_mask
 
 .. autofunction:: pad_crop
 

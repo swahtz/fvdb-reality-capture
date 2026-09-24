@@ -66,7 +66,7 @@ def _finish_dense_render(
     """Slice a full-size render to its crop, then apply the per-pixel mask over the crop only."""
     images, alphas = apply_crop(images, alphas, crop)
     if masks is not None:
-        images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
+        images, alphas = apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
     return images, alphas
 
 
@@ -195,10 +195,24 @@ def pixel_mask_to_tile_mask(pixel_mask: torch.Tensor, tile_size: int) -> torch.T
     return pooled.bool().squeeze(1)
 
 
-def _apply_pixel_mask(
+def apply_pixel_mask(
     images: torch.Tensor, alphas: torch.Tensor, pixel_mask: torch.Tensor, backgrounds: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fill masked-out pixels with the background and zero alpha; the tile mask only skips whole tiles."""
+    """Fill masked-out pixels of a render with the background at zero alpha.
+
+    The rasterizers skip whole tiles; this is the per-pixel pass that follows, and it works on any
+    render, so a crop can be masked after slicing without building a full-image mask.
+
+    Args:
+        images (torch.Tensor): Rendered features, ``[C, H, W, D]``.
+        alphas (torch.Tensor): Rendered alphas, ``[C, H, W, 1]``.
+        pixel_mask (torch.Tensor): Boolean mask, ``[C, H, W]``; ``True`` keeps the rendered pixel.
+        backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
+
+    Returns:
+        images (torch.Tensor): ``[C, H, W, D]`` with masked-out pixels set to the background.
+        alphas (torch.Tensor): ``[C, H, W, 1]`` with masked-out pixels set to zero.
+    """
     keep = pixel_mask.unsqueeze(-1).to(images.dtype)
     background = _background_like(images, backgrounds)
     return images * keep + background * (1.0 - keep), alphas * keep
@@ -233,6 +247,8 @@ def rasterize_screen_space_gaussians(
             receive the background with zero alpha and no gradient.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep,
             clamped to the image.
+            A crop entirely outside the image raises; :meth:`GaussianSplat3d.render_from_projected_gaussians`
+            pads such crops with background instead.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
@@ -297,7 +313,10 @@ def rasterize_world_space_gaussians(
             Required for the OpenCV camera models; ``None`` is allowed for pinhole and orthographic cameras.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
         masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``.
-        crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep.
+        crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep,
+            clamped to the image.
+            A crop entirely outside the image raises; :meth:`GaussianSplat3d.render_from_projected_gaussians`
+            pads such crops with background instead.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
@@ -368,6 +387,14 @@ def rasterize_screen_space_gaussians_sparse(
     """
     opacities = check_opacities(opacities, projected)
     check_tiles_match(sparse_tiles, projected)
+    if tile_masks is not None:
+        expected = tuple(sparse_tiles.active_tile_mask.shape)
+        if tuple(tile_masks.shape) != expected:
+            raise ValueError(
+                f"tile_masks must be a per-tile [C, tiles_h, tiles_w] mask of shape {expected}, got {tuple(tile_masks.shape)}"
+            )
+        if tile_masks.device != opacities.device:
+            raise ValueError(f"tile_masks must be on {opacities.device}, got {tile_masks.device}")
     rendered, alphas = cast(
         tuple[torch.Tensor, torch.Tensor],
         _RasterizeScreenSpaceGaussiansSparseFn.apply(

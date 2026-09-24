@@ -177,6 +177,18 @@ def _forward_only_explanation(forward_only: list[CameraModel], config: "Gaussian
     )
 
 
+def _pose_optimization_note(camera_models: list[CameraModel], config: "GaussianSplatReconstructionConfig") -> str:
+    """Explain what pose optimization loses for cameras that render in world space, or return ``""``."""
+    if not config.optimize_camera_poses or not camera_models:
+        return ""
+    names = ", ".join(camera_model.name for camera_model in camera_models)
+    return (
+        f" Camera pose optimization is enabled, but the world-space rasterizer returns no gradient for the camera "
+        f"matrices, so the poses of {names} views are trained only through the view direction of the spherical "
+        "harmonics and the depth term, not through the rendered geometry."
+    )
+
+
 def _distinct_camera_batches(
     dataset: SfmDataset, device: torch.device
 ) -> Iterator[tuple[CameraModel, torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]]:
@@ -620,6 +632,9 @@ class WorldSpaceRenderBackend:
             device (torch.device): Device on which validation probes should run.
         """
         _check_camera_batching(dataset, config)
+        note = _pose_optimization_note([CameraModel(m) for m in sorted(set(dataset.camera_models.tolist()))], config)
+        if note:
+            _logger.warning(note.strip())
         with torch.no_grad():
             for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
                 dataset, device
@@ -834,7 +849,9 @@ class RoutedRenderBackend:
                 _forward_only_explanation(forward_only, config)
                 + " Views from those cameras are rendered in world space, which differentiates through the 3D "
                 "parameters directly; views from other cameras stay in image space. Gaussian densification "
-                "statistics come only from image-space views. Undistort the images to train every view in image space."
+                "statistics come only from image-space views."
+                + _pose_optimization_note(forward_only, config)
+                + " Undistort the images to train every view in image space."
             )
         with torch.no_grad():
             for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(

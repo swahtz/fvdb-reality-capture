@@ -181,8 +181,8 @@ def _expand_contributions(
         if len(expanded) == num_cameras:
             return expanded
         # from_data_offsets_and_list_ids takes the camera count from the largest list id, so cameras after
-        # the last one with a requested pixel are dropped. The nested constructor keeps them; it costs one
-        # Python object per pixel, so it is used only when that happens.
+        # the last one with a requested pixel are dropped (openvdb/fvdb-core#802). The nested constructor
+        # keeps them at the cost of one tensor per pixel on the host, so it is used only in that case.
         per_pixel = JaggedTensor.from_data_and_offsets(data, offsets).unbind()
         nested: list[list[torch.Tensor]] = []
         start = 0

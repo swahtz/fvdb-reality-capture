@@ -16,6 +16,7 @@ from fvdb.types import DeviceIdentifier, cast_check, resolve_device
 
 from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
+    apply_pixel_mask,
     GaussianTileIntersection,
     ProjectedGaussians,
     as_pixel_jagged,
@@ -2193,24 +2194,22 @@ class GaussianSplat3d:
             # connected to the projection, with zero gradient, whenever the projection is differentiable.
             empty = pg.render_quantities[:, :0].reshape(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
             return pad_crop(empty, empty[..., :1], requested_h, requested_w, backgrounds)
-        full_masks = masks
-        if crop is not None:
-            origin_w, origin_h, crop_w, crop_h = crop
-            if masks is not None:
-                # Embed its clipped region in the full image.
-                full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
-                full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[
-                    :, :crop_h, :crop_w
-                ].bool()
+        crop_masks = None
+        if crop is not None and masks is not None:
+            # The mask is in crop coordinates, so it is applied to the sliced render below rather than
+            # embedded in a full-image mask for the stage function.
+            crop_masks = masks[:, : crop[3], : crop[2]].bool()
         images, alphas = rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
             pg.opacities,
             tiles if tiles is not None else pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
-            masks=full_masks,
+            masks=masks if crop is None else None,
             crop=crop,
         )
+        if crop_masks is not None:
+            images, alphas = apply_pixel_mask(images, alphas, crop_masks, backgrounds)
         # A crop that ran past the image edge keeps its requested size, with the outside as background.
         return pad_crop(images, alphas, requested_h, requested_w, backgrounds)
 

@@ -40,9 +40,10 @@ def evaluate_gaussian_sh(
 
     Gaussians culled by the projection (zero radii) receive zero features. Differentiable with
     respect to ``sh0``, ``shN``, ``means`` and ``world_to_camera_matrices``. The depth channel is the
-    view-space depth of each Gaussian center. The analytic projection provides it with a gradient; the
-    unscented projection is forward-only, so when a gradient is wanted the depth is recomputed here from
-    ``means`` and ``world_to_camera_matrices``, which is exact because depth is linear in the center.
+    view-space depth of each Gaussian center. When a gradient is wanted it is recomputed here from
+    ``means`` and ``world_to_camera_matrices``, which is exact because depth is linear in the center and
+    costs one einsum in the backward instead of the projection's full backward kernel (the unscented
+    projection has none).
 
     Args:
         means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
@@ -60,13 +61,14 @@ def evaluate_gaussian_sh(
     depths = projected.depths
     if (
         render_mode != GaussianRenderMode.FEATURES
-        and not projected.is_differentiable
         and torch.is_grad_enabled()
         and (means.requires_grad or world_to_camera_matrices.requires_grad)
     ):
+        # Depth is linear in the center, so this is exact for either projection, and its backward is an
+        # elementwise product and a sum rather than the analytic projection's full backward kernel.
         rotation_z = world_to_camera_matrices[:, 2, :3]  # [C, 3]
         translation_z = world_to_camera_matrices[:, 2, 3:4]  # [C, 1]
-        depths = torch.einsum("cj,nj->cn", rotation_z, means) + translation_z
+        depths = (rotation_z.unsqueeze(1) * means.unsqueeze(0)).sum(-1) + translation_z  # [C, N]
     depths = depths.unsqueeze(-1)
     if render_mode == GaussianRenderMode.DEPTH:
         return depths

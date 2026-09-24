@@ -109,6 +109,28 @@ def _scale_shift_invariant_l1(
     return torch.stack(per_image_losses).mean()
 
 
+_SSIM_WINDOW = 11
+
+
+def _check_crop_size(image_sizes: np.ndarray, crops_per_image: int) -> None:
+    """Raise unless every crop of every training image covers at least the SSIM window.
+
+    Args:
+        image_sizes (np.ndarray): ``(I, 2)`` array of ``(height, width)`` per training image.
+        crops_per_image (int): Crops per side, as in :attr:`GaussianSplatReconstructionConfig.crops_per_image`.
+    """
+    if crops_per_image < 1:
+        raise ValueError(f"crops_per_image must be at least 1, got {crops_per_image}")
+    if len(image_sizes) == 0:
+        return
+    smallest = int(image_sizes.min()) // crops_per_image
+    if smallest < _SSIM_WINDOW:
+        raise ValueError(
+            f"crops_per_image={crops_per_image} gives crops as small as {smallest} pixels on the smallest training "
+            f"image ({int(image_sizes.min())} pixels); each crop must cover the {_SSIM_WINDOW}-pixel SSIM window"
+        )
+
+
 @dataclass
 class _DepthTargets:
     """Depth supervision for one training view, in full-image pixel coordinates.
@@ -338,9 +360,11 @@ class GaussianSplatReconstructionConfig:
     The Gaussians are projected once per image and every crop rasterizes from that projection, skipping
     tiles outside the crop. Each crop's loss is weighted by its share of the image before its backward, so
     the per-pixel terms (L1 and depth) sum to the full-image loss and the gradient reaches the shared
-    projection once, as with ``crops_per_image=1``. Two things differ from whole-image training: SSIM is
-    computed per crop with zero padding, so its windows along crop seams do not see the neighbouring crop,
+    projection once, as with ``crops_per_image=1``. Three things differ from whole-image training: SSIM is
+    computed per crop with zero padding, so its windows along crop seams do not see the neighbouring crop;
+    the scale-and-shift-invariant dense depth loss fits its scale and shift per crop rather than per image;
     and rows or columns left over when the image size is not divisible by this count are not supervised.
+    Every crop must be at least 11 pixels on a side, the SSIM window, or training raises.
     The raster output buffers are still allocated at full image size (openvdb/fvdb-core#800), so it
     reduces peak memory less than the crop area alone would suggest.
 
@@ -1037,6 +1061,7 @@ class GaussianSplatReconstruction:
 
         self.device: torch.device = model.device
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
+        _check_crop_size(self._training_dataset.image_sizes, self._cfg.crops_per_image)
 
         self._global_step: int = 0
 

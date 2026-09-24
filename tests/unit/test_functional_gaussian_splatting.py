@@ -30,6 +30,7 @@ from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
 from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch, crop_loss_weight
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import (
     GaussianSplatReconstructionConfig,
+    _check_crop_size,
     _DepthTargets,
     _train_crop,
 )
@@ -301,6 +302,11 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
                 projected, features, opacities, sparse_tiles, tile_masks=all_tiles
             )
             torch.testing.assert_close(same.jdata, rendered.jdata)
+            # A per-pixel mask handed in as a tile mask is refused instead of skipping the wrong tiles.
+            with self.assertRaisesRegex(ValueError, "per-tile"):
+                F.rasterize_screen_space_gaussians_sparse(
+                    projected, features, opacities, sparse_tiles, tile_masks=torch.ones(self.C, self.H, self.W)
+                )
             for c in range(self.C):
                 px = pixels[c].jdata
                 self.assertEqual(tuple(rendered[c].jdata.shape), (px.shape[0], 3))
@@ -717,6 +723,15 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         view.finish_backward()
         self.assertGreater(float(params[0].grad.abs().max()), 0.0)
 
+    def test_crops_must_cover_the_ssim_window(self):
+        sizes = np.array([[420, 648], [64, 96]])
+        _check_crop_size(sizes, 1)
+        _check_crop_size(sizes, 5)  # 64 // 5 = 12
+        with self.assertRaisesRegex(ValueError, "SSIM window"):
+            _check_crop_size(sizes, 6)  # 64 // 6 = 10
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            _check_crop_size(sizes, 0)
+
     def test_training_a_crop_releases_its_graph_and_the_view_releases_its_copies(self):
         # World space, so the view's detached copy is a full-size image and its gradient another one.
         params = self._params(requires_grad=True)
@@ -798,6 +813,16 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         self.assertIn("OPENCV_RADTAN_5", logs.output[0])
         self.assertIn("world space", logs.output[0])
         self.assertIn("densification", logs.output[0].lower())
+        # The default config optimizes poses, and world space gives the camera matrices no gradient.
+        self.assertIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING") as logs:
+            routed.validate_scene_cameras(
+                model, opencv, GaussianSplatReconstructionConfig(optimize_camera_poses=False), self.device
+            )
+        self.assertNotIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING") as logs:
+            WorldSpaceRenderBackend().validate_scene_cameras(model, opencv, config, self.device)
+        self.assertIn("pose optimization", logs.output[0].lower())
         with self.assertRaisesRegex(ValueError, "world_space"):
             pure.validate_scene_cameras(model, opencv, config, self.device)
         pinhole_unscented = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
