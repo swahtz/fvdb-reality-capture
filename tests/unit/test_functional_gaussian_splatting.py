@@ -8,6 +8,8 @@ against itself across the dense, sparse, cropped and world-space paths.
 """
 
 import unittest
+import weakref
+from dataclasses import astuple
 from unittest import mock
 
 import numpy as np
@@ -26,7 +28,11 @@ from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
     make_render_backend,
 )
 from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch, crop_loss_weight
-from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import GaussianSplatReconstructionConfig
+from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import (
+    GaussianSplatReconstructionConfig,
+    _DepthTargets,
+    _train_crop,
+)
 
 
 def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
@@ -552,6 +558,25 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             torch.testing.assert_close(images, background[:, None, None, :].expand_as(images))
             self.assertEqual(float(alphas.abs().max()), 0.0)
 
+    def test_crops_outside_the_image_stay_differentiable(self):
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        outside = dict(crop_width=10, crop_height=10, crop_origin_w=self.W, crop_origin_h=0)
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        images, alphas = model.render_from_projected_gaussians(pg, **outside)
+        self.assertTrue(images.requires_grad)
+        self.assertTrue(alphas.requires_grad)
+        # Nothing was rendered, so backward runs and every gradient it produces is zero.
+        (images.sum() + alphas.sum()).backward()
+        grads = [p.grad for p in params if p.grad is not None]
+        self.assertTrue(grads)
+        self.assertTrue(all(float(g.abs().max()) == 0.0 for g in grads))
+        with torch.no_grad():
+            pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+            images, alphas = model.render_from_projected_gaussians(pg, **outside)
+        self.assertFalse(images.requires_grad)
+        self.assertFalse(alphas.requires_grad)
+
     def test_empty_selection(self):
         params = self._params()
         means, quats, log_scales, logit_opacities, sh0, shN = params
@@ -669,6 +694,45 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         self.assertIsNone(params[0].grad)
         view.finish_backward()
         self.assertGreater(float(params[0].grad.abs().max()), 0.0)
+
+    def test_training_a_crop_releases_its_graph_and_the_view_releases_its_copies(self):
+        # World space, so the view's detached copy is a full-size image and its gradient another one.
+        params = self._params(requires_grad=True)
+        model = self._model(params)
+        config = GaussianSplatReconstructionConfig()
+        view = self._forward_train(WorldSpaceRenderBackend(), model, config)
+        copy = weakref.ref(view._rendered)
+        gt = torch.zeros(self.C, self.H, self.W, 3, dtype=torch.uint8)
+        for pixels, mask_pixels, crop, _ in crop_image_batch(gt, None, 2):
+            losses = _train_crop(
+                view,
+                crop,
+                crop_loss_weight(crop, self.H, self.W),
+                pixels,
+                mask_pixels,
+                _DepthTargets(),
+                config,
+                self.device,
+            )
+            self.assertFalse(any(term.requires_grad for term in astuple(losses)))
+        # The crops accumulated into the copy; the shared backward hands that gradient on and drops it.
+        self.assertIsNotNone(view._rendered.grad)
+        view.finish_backward()
+        self.assertIsNone(view._rendered.grad)
+        self.assertGreater(float(params[0].grad.abs().max()), 0.0)
+        # Nothing outside the view holds a crop graph, so the copy dies with the view, before the next step.
+        del view
+        self.assertIsNone(copy())
+        # A loss kept alive past its backward would hold the copy through its AccumulateGrad node.
+        view = self._forward_train(WorldSpaceRenderBackend(), model, config)
+        copy = weakref.ref(view._rendered)
+        held = view.render_crop((0, 0, self.W, self.H)).image.sum()
+        held.backward()
+        view.finish_backward()
+        del view
+        self.assertIsNotNone(copy())
+        del held
+        self.assertIsNone(copy())
 
     def test_image_space_backend_renders_forward_only_camera_batches_through_world_space(self):
         # In a scene that mixes pinhole and distortion cameras, the pinhole batches keep image space and

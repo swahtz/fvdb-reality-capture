@@ -96,6 +96,9 @@ class _SharedWork:
         connected = [(tensor, leaf.grad) for tensor, leaf in zip(self._tensors, self.leaves) if leaf.grad is not None]
         if connected:
             torch.autograd.backward([tensor for tensor, _ in connected], [grad for _, grad in connected])
+        # The gradients have been handed on, so they are dropped here rather than living as long as the leaves.
+        for leaf in self.leaves:
+            leaf.grad = None
 
 
 class _ProjectedTrainingView:

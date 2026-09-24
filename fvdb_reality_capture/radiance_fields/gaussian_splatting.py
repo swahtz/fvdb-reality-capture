@@ -2066,7 +2066,8 @@ class GaussianSplat3d:
 
             The output always has the requested crop size. Where the crop runs past the image boundary,
             the part inside the image is rendered and the rest is filled with the background at zero
-            alpha; a crop that lies entirely outside the image is all background.
+            alpha; a crop that lies entirely outside the image is all background. Either way the output
+            is differentiable with respect to the projection whenever the projection is.
 
 
         Example:
@@ -2152,7 +2153,9 @@ class GaussianSplat3d:
         requested_h, requested_w = crop_h, crop_w
         if origin_w >= width or origin_h >= height:
             # Entirely outside the image: nothing to rasterize, so the crop is all background at zero alpha.
-            empty = pg.render_quantities.new_zeros(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
+            # The empty render is sliced from the features rather than allocated, so the output stays
+            # connected to the projection, with zero gradient, whenever the projection is differentiable.
+            empty = pg.render_quantities[:, :0].reshape(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
             return pad_crop(empty, empty[..., :1], requested_h, requested_w, backgrounds)
         crop = None
         full_masks = masks
