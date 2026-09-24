@@ -604,9 +604,11 @@ class TestGaussianSplatIndexSet(BaseGaussianTestCase):
                 )
             )
             if track_max_2d_radii:
+                # Radii are recorded whether or not the mean gradients are, so the source has them and
+                # they are copied like any other accumulator both sides track.
                 assertfun(
                     torch.equal(
-                        torch.zeros(src.num_gaussians).to(dst.accumulated_max_2d_radii),
+                        src.accumulated_max_2d_radii,
                         selfun(dst.accumulated_max_2d_radii),
                     )
                 )

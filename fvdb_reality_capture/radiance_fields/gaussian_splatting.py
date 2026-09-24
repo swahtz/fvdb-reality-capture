@@ -73,6 +73,7 @@ class ProjectedGaussianSplats:
         far_plane: float,
         min_radius_2d: float,
         sh_degree_to_use: int,
+        opacities: torch.Tensor | None = None,
         _private: Any = None,
     ) -> None:
         """
@@ -93,7 +94,7 @@ class ProjectedGaussianSplats:
         self._sh_degree_to_use = sh_degree_to_use
         # Computed here, alongside the features, so the projection is a consistent snapshot of the model.
         # Deriving them at render time would mix the logits as they are then with the geometry as it was.
-        self._opacities = compute_gaussian_opacities(logit_opacities, projected)
+        self._opacities = opacities if opacities is not None else compute_gaussian_opacities(logit_opacities, projected)
 
     @property
     def projected_gaussians(self) -> ProjectedGaussians:
@@ -317,6 +318,8 @@ class ProjectedGaussianSplats:
 
         Returns:
             sh_degree_to_use (int): The spherical harmonic degree used during projection.
+            opacities (torch.Tensor | None): The per-camera opacities of ``projected``, ``(C, N)``, when the caller
+                already computed them; derived from ``logit_opacities`` and ``projected`` otherwise.
         """
         return self._sh_degree_to_use
 
@@ -1518,9 +1521,12 @@ class GaussianSplat3d:
             accumulated_gradient_step_counts=step_counts,
             accumulated_max_2d_radii=max_radii,
         )
-        if not accumulate_statistics and max_radii is not None:
-            # The kernel records radii only inside its gradient-statistics pass, so record them here for
-            # projections that skip it: the largest radius of each Gaussian over the batch, as the kernel does.
+        kernel_records_radii = grad_norms is not None and step_counts is not None and projected.is_differentiable
+        if max_radii is not None and not kernel_records_radii and torch.is_grad_enabled():
+            # The analytic kernel records radii only in its backward, inside the gradient-statistics pass.
+            # A projection that pass will not see (gradient accumulators withheld or disabled, or the
+            # unscented projection) records them here instead, in a training forward only, so evaluation
+            # and validation probes leave the accumulators alone as they do in image space.
             with torch.no_grad():
                 max_radii.copy_(torch.maximum(max_radii, projected.radii.amax(dim=(0, 2)).to(max_radii.dtype)))
         return projected
@@ -1594,7 +1600,7 @@ class GaussianSplat3d:
         ``accumulate_statistics`` is passed to :meth:`_project`; the world-space training path turns it
         off, since its views must not count as densification samples.
         """
-        projected = self._project(
+        projected, opacities = self._project_and_opacities(
             world_to_camera_matrices=world_to_camera_matrices,
             projection_matrices=projection_matrices,
             image_width=image_width,
@@ -1620,6 +1626,7 @@ class GaussianSplat3d:
             far_plane=far,
             min_radius_2d=min_radius_2d,
             sh_degree_to_use=sh_degree_to_use,
+            opacities=opacities,
             _private=ProjectedGaussianSplats.__PRIVATE__,
         )
 
@@ -2103,9 +2110,9 @@ class GaussianSplat3d:
 
         .. note::
 
-            If you want to render the full image, pass negative values for ``crop_width``, ``crop_height``,
-            ``crop_origin_w``, and ``crop_origin_h`` (default behavior). To render full images,
-            all these values must be negative or this method will raise an error.
+            A negative value for any of ``crop_width``, ``crop_height``, ``crop_origin_w`` and ``crop_origin_h``
+            means its default: the full image width or height, or an origin of zero. All four negative (the
+            default) renders the full image.
 
         .. note::
 
@@ -2172,7 +2179,8 @@ class GaussianSplat3d:
                 If ``None``, background is treated as 0.
             masks (torch.Tensor | None): Optional per-pixel boolean mask in crop coordinates, of the requested
                 crop size ``(C, cropH, cropW)`` or of its size after clipping to the image, on the projection's
-                device. ``True`` means render, ``False`` means skip (filled with background).
+                device. ``True`` means render, ``False`` means skip (filled with background). Without a crop it
+                is a full-image mask.
             tiles (GaussianTileIntersection | None): The tile intersections of ``projected_gaussians`` at
                 ``tile_size``, from :meth:`ProjectedGaussianSplats.tile_intersection`. Computed here when
                 ``None``. Pass them when rendering several crops from one projection, so the Gaussians are
@@ -2204,8 +2212,8 @@ class GaussianSplat3d:
         elif tile_size is None:
             tile_size = 16
         # The stage function clips the crop at the image edge (to nothing, if it lies entirely outside),
-        # checks the mask against the requested or clipped crop size, and returns the clipped part; it is
-        # padded back below, so the output has the requested size.
+        # checks the crop mask against the requested or clipped crop size, and returns the clipped part; it
+        # is padded back below, so the output has the requested size.
         crop = (origin_w, origin_h, crop_w, crop_h) if is_crop else None
         images, alphas = rasterize_screen_space_gaussians(
             projected,
@@ -2213,8 +2221,9 @@ class GaussianSplat3d:
             pg.opacities,
             tiles if tiles is not None else pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
-            masks=masks,
+            masks=masks if crop is None else None,
             crop=crop,
+            crop_masks=masks if crop is not None else None,
         )
         return pad_crop(images, alphas, requested_h, requested_w, backgrounds)
 

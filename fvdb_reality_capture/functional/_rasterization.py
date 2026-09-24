@@ -79,6 +79,7 @@ def _finish_dense_render(
 def _render_masks(
     crop: Crop | None,
     masks: torch.Tensor | None,
+    crop_masks: torch.Tensor | None,
     projected: ProjectedGaussians,
     tiles: GaussianTileIntersection,
     device: torch.device,
@@ -88,25 +89,27 @@ def _render_masks(
     Checks that ``tiles`` belong to ``projected`` first. Returns the clipped crop, the per-pixel mask in
     the output's coordinates to apply after rendering and slicing (``None`` when no pixel mask was given,
     since slicing to the crop already discards out-of-crop pixels), and the per-tile mask that lets the
-    rasterizer skip tiles outside the crop or fully masked out. With a crop, ``masks`` may cover the full
-    image, the crop as requested, or the crop as clipped to the image (a mask matching both a crop size and
-    the image is read as a crop mask); either way the tile mask is pooled from it so masked-out tiles are
-    skipped, without building a full-image mask. The tile grid comes from ``tiles`` so it cannot drift from
-    the intersection's.
+    rasterizer skip tiles outside the crop or fully masked out. ``masks`` is always in image coordinates
+    and ``crop_masks`` always in crop coordinates (the crop as requested or as clipped to the image), so
+    a shape never has to be guessed; the tile mask is pooled from whichever was given, without building a
+    full-image mask. The tile grid comes from ``tiles`` so it cannot drift from the intersection's.
     """
     check_tiles_match(tiles, projected)
     num_cameras = projected.num_cameras
     tile_size = tiles.tile_size
     full_shape = (num_cameras, tiles.image_height, tiles.image_width)
-    if masks is not None and masks.device != device:
-        raise ValueError(f"masks must be on {device}, got {masks.device}")
+    if masks is not None and crop_masks is not None:
+        raise ValueError("pass either masks (image coordinates) or crop_masks (crop coordinates), not both")
+    if crop_masks is not None and crop is None:
+        raise ValueError("crop_masks needs a crop")
+    for name, tensor in (("masks", masks), ("crop_masks", crop_masks)):
+        if tensor is not None and tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+    if masks is not None and tuple(masks.shape) != full_shape:
+        raise ValueError(f"masks must be a full-image [C, H, W] mask of shape {full_shape}, got {tuple(masks.shape)}")
     if crop is None:
         if masks is None:
             return None, None, None
-        if tuple(masks.shape) != full_shape:
-            raise ValueError(
-                f"masks must be a full-image [C, H, W] mask of shape {full_shape}, got {tuple(masks.shape)}"
-            )
         masks = masks.bool()
         return None, masks, pixel_mask_to_tile_mask(masks, tile_size)
     requested_shape = (num_cameras, crop[3], crop[2])
@@ -115,19 +118,17 @@ def _render_masks(
     tile_y1, tile_x1 = -(-(origin_h + height) // tile_size), -(-(origin_w + width) // tile_size)
     tile_window = torch.zeros(num_cameras, tiles.num_tiles_h, tiles.num_tiles_w, dtype=torch.bool, device=device)
     tile_window[:, tile_y0:tile_y1, tile_x0:tile_x1] = True
-    if masks is None:
+    if masks is None and crop_masks is None:
         return clipped, None, tile_window
     crop_shape = (num_cameras, height, width)
-    if tuple(masks.shape) in (crop_shape, requested_shape):
-        # A mask of the requested crop size covers the clipped part in its top-left corner. This is checked
-        # first: a crop the size of the image is read as a crop mask, never windowed as a full-image one.
-        crop_mask = masks[:, :height, :width].bool()
-    elif tuple(masks.shape) == full_shape:
+    if masks is not None:
         crop_mask = _window(masks.bool(), clipped)
+    elif tuple(crop_masks.shape) in (crop_shape, requested_shape):
+        # A mask of the requested crop size covers the clipped part in its top-left corner.
+        crop_mask = crop_masks[:, :height, :width].bool()
     else:
         raise ValueError(
-            f"masks must match the image {full_shape}, the crop {requested_shape} or its clipped size {crop_shape}, "
-            f"got {tuple(masks.shape)}"
+            f"crop_masks must match the crop {requested_shape} or its clipped size {crop_shape}, got {tuple(crop_masks.shape)}"
         )
     # Pool the crop mask over the crop's tiles. The crop need not start on a tile boundary, so the mask is
     # placed at its offset within the first tile before pooling.
@@ -253,6 +254,7 @@ def rasterize_screen_space_gaussians(
     backgrounds: torch.Tensor | None = None,
     masks: torch.Tensor | None = None,
     crop: Crop | None = None,
+    crop_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Alpha-blend projected Gaussians into dense images.
 
@@ -270,19 +272,20 @@ def rasterize_screen_space_gaussians(
             Compute them once per render and pass the same tensor to every stage.
         tiles (GaussianTileIntersection): Output of :func:`intersect_gaussian_tiles` for ``projected``.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
-        masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``. Masked-out pixels
-            receive the background with zero alpha and no gradient. With ``crop``, a mask of the crop's
-            requested or clipped size is accepted too.
+        masks (torch.Tensor | None): Boolean per-pixel render mask in image coordinates, ``[C, H, W]``.
+            Masked-out pixels receive the background with zero alpha and no gradient.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep,
             clipped to the image; a crop entirely outside it yields an empty ``[C, 0, 0, D]`` render, which
             :meth:`GaussianSplat3d.render_from_projected_gaussians` pads back to the requested size.
+        crop_masks (torch.Tensor | None): Boolean per-pixel render mask in crop coordinates, of the crop's
+            requested ``[C, height, width]`` or clipped size; an alternative to ``masks`` when a crop is given.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
     opacities = check_opacities(opacities, projected)
-    crop, masks, tile_masks = _render_masks(crop, masks, projected, tiles, opacities.device)
+    crop, masks, tile_masks = _render_masks(crop, masks, crop_masks, projected, tiles, opacities.device)
     if crop is not None and (crop[2] == 0 or crop[3] == 0):
         return _empty_render(features)
     images, alphas = cast(
@@ -321,6 +324,7 @@ def rasterize_world_space_gaussians(
     backgrounds: torch.Tensor | None = None,
     masks: torch.Tensor | None = None,
     crop: Crop | None = None,
+    crop_masks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Alpha-blend 3D Gaussians into dense images by evaluating them along per-pixel rays.
 
@@ -341,11 +345,12 @@ def rasterize_world_space_gaussians(
         distortion_coeffs (torch.Tensor | None): Packed OpenCV distortion coefficients, ``[C, 12]``.
             Required for the OpenCV camera models; ``None`` is allowed for pinhole and orthographic cameras.
         backgrounds (torch.Tensor | None): Per-camera background features, ``[C, D]``. Black if ``None``.
-        masks (torch.Tensor | None): Boolean per-pixel render mask, ``[C, H, W]``. With ``crop``, a mask of
-            the crop's requested or clipped size is accepted too.
+        masks (torch.Tensor | None): Boolean per-pixel render mask in image coordinates, ``[C, H, W]``.
         crop (tuple[int, int, int, int] | None): ``(origin_w, origin_h, width, height)`` window to keep,
             clipped to the image; a crop entirely outside it yields an empty ``[C, 0, 0, D]`` render, which
             :meth:`GaussianSplat3d.render_from_projected_gaussians` pads back to the requested size.
+        crop_masks (torch.Tensor | None): Boolean per-pixel render mask in crop coordinates, of the crop's
+            requested ``[C, height, width]`` or clipped size; an alternative to ``masks`` when a crop is given.
 
     Returns:
         images (torch.Tensor): Blended features, ``[C, H, W, D]`` (or the crop size).
@@ -359,7 +364,7 @@ def rasterize_world_space_gaussians(
         distortion_coeffs = torch.zeros(
             projected.num_cameras, 12, device=world_to_camera_matrices.device, dtype=world_to_camera_matrices.dtype
         )
-    crop, masks, tile_masks = _render_masks(crop, masks, projected, tiles, opacities.device)
+    crop, masks, tile_masks = _render_masks(crop, masks, crop_masks, projected, tiles, opacities.device)
     if crop is not None and (crop[2] == 0 or crop[3] == 0):
         return _empty_render(features)
     images, alphas = cast(

@@ -418,16 +418,23 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             projected, features, opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
         )
         torch.testing.assert_close(with_float, crop, atol=1e-5, rtol=1e-5)
-        # With a crop the stage also takes a crop-sized mask, and pools the skipped tiles from it.
+        # With a crop the stage also takes a crop-space mask through crop_masks, and pools the skipped
+        # tiles from it; masks stays in image coordinates, so neither shape is ever guessed.
         stage_masked, _ = F.rasterize_screen_space_gaussians(
-            projected, features, opacities, tiles, masks=mask, crop=(ox, oy, w, h)
+            projected, features, opacities, tiles, crop=(ox, oy, w, h), crop_masks=mask
         )
         torch.testing.assert_close(stage_masked, masked, atol=1e-5, rtol=1e-5)
-        # A mask of any other size is rejected rather than read from its top-left corner; the class
-        # method hands its crop-space mask to the same check.
-        with self.assertRaisesRegex(ValueError, "match the image .* the crop .* clipped size"):
+        with self.assertRaisesRegex(ValueError, "not both"):
             F.rasterize_screen_space_gaussians(
-                projected, features, opacities, tiles, masks=mask[:, :-1], crop=(ox, oy, w, h)
+                projected, features, opacities, tiles, masks=float_mask, crop=(ox, oy, w, h), crop_masks=mask
+            )
+        with self.assertRaisesRegex(ValueError, "needs a crop"):
+            F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, crop_masks=mask)
+        # A crop mask of any other size is rejected rather than read from its top-left corner; the class
+        # method hands its crop-space mask to the same check.
+        with self.assertRaisesRegex(ValueError, "crop_masks must match the crop .* clipped size"):
+            F.rasterize_screen_space_gaussians(
+                projected, features, opacities, tiles, crop=(ox, oy, w, h), crop_masks=mask[:, :-1]
             )
         with self.assertRaisesRegex(ValueError, "clipped size"):
             model.render_from_projected_gaussians(
@@ -807,7 +814,20 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         radii = model.accumulated_max_2d_radii
         self.assertIsNotNone(radii)
         self.assertGreater(int(radii.max()), 0)
-        # A crop the size of the image at a nonzero origin is read as a crop mask, not windowed as a full one.
+        # Evaluation and probes run without grad and leave the accumulators alone, as image space does.
+        radii_before = radii.clone()
+        with torch.no_grad():
+            model.render_images_from_world(self.w2c, self.K, self.W, self.H, 0.01, 1e10, antialias=True)
+        self.assertTrue(torch.equal(model.accumulated_max_2d_radii, radii_before))
+        # The unscented projection never reaches the kernel's gradient pass, so a training forward records
+        # its radii here too.
+        model.reset_accumulated_gradient_state()
+        model.project_gaussians_for_images(
+            self.w2c, self.K, self.W, self.H, 0.01, 1e10, projection_method=ProjectionMethod.UNSCENTED
+        )
+        self.assertGreater(int(model.accumulated_max_2d_radii.max()), 0)
+        # A crop mask the size of the image at a nonzero origin is read in crop coordinates, since crop_masks
+        # is a separate argument from the image-coordinate masks.
         pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
         crop_mask = torch.zeros(self.C, self.H, self.W, dtype=torch.bool, device=self.device)
         crop_mask[:, :20, :20] = True
@@ -816,8 +836,8 @@ class TestRenderBackends(FunctionalPipelineTestCase):
             pg.render_quantities,
             pg.opacities,
             pg.tile_intersection(16),
-            masks=crop_mask,
             crop=(5, 7, self.W, self.H),
+            crop_masks=crop_mask,
         )
         plain, _ = F.rasterize_screen_space_gaussians(
             pg.projected_gaussians,
