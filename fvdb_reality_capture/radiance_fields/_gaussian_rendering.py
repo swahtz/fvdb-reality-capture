@@ -5,14 +5,13 @@ import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol
 
-import numpy as np
 import torch
 
 from ..enums import CameraModel, ProjectionMethod
 from ..functional import (
     Crop,
-    apply_crop,
     rasterize_screen_space_gaussians,
+    rasterize_world_space_gaussians,
     requires_distortion_coeffs,
     resolve_projection_method,
 )
@@ -128,30 +127,56 @@ class _ProjectedTrainingView:
 
 
 class _WorldSpaceTrainingView:
-    """World-space view: each crop is rendered directly, since there is no projection stage to share.
+    """World-space view: projection, features, opacities and tiles are computed once, each crop rasterizes.
 
-    The world-space rasterizer differentiates through the 3D parameters, so each crop's backward reaches
-    the model on its own and no full-image render is kept alive across crops. The camera matrices are the
-    one input the crops share (they carry the pose-adjustment graph), so the crops render from detached
-    copies of them and :meth:`finish_backward` propagates their accumulated gradient once.
+    The world-space rasterizer differentiates through the 3D parameters directly, so the crops reach
+    ``means``, ``quats`` and ``log_scales`` on their own. Features, opacities and the camera matrices are
+    the shared inputs (the features carry the spherical-harmonics graph, the cameras the pose-adjustment
+    one), so the crops rasterize from detached copies of them and :meth:`finish_backward` propagates
+    their accumulated gradients once.
     """
 
     def __init__(
-        self, render: "Callable[..., tuple[torch.Tensor, torch.Tensor]]", arguments: dict[str, Any], num_channels: int
+        self,
+        model: GaussianSplat3d,
+        projected_gaussians: ProjectedGaussianSplats,
+        world_to_camera_matrices: torch.Tensor,
+        projection_matrices: torch.Tensor,
+        distortion_coeffs: torch.Tensor | None,
+        tile_size: int,
+        num_channels: int,
     ) -> None:
-        self._shared = _SharedWork([arguments["world_to_camera_matrices"], arguments["projection_matrices"]])
-        world_to_camera_matrices, projection_matrices = self._shared.leaves
-        self._arguments = {
-            **arguments,
-            "world_to_camera_matrices": world_to_camera_matrices,
-            "projection_matrices": projection_matrices,
-        }
-        self._render = render
+        self._model = model
+        self._projected = projected_gaussians.projected_gaussians
+        self._shared = _SharedWork(
+            [
+                projected_gaussians.render_quantities,
+                projected_gaussians.opacities,
+                world_to_camera_matrices,
+                projection_matrices,
+            ]
+        )
+        self._features, self._opacities, self._world_to_camera, self._projection = self._shared.leaves
+        self._distortion_coeffs = distortion_coeffs
+        self._tiles = projected_gaussians.tile_intersection(tile_size)
         self._num_channels = num_channels
 
     def render_crop(self, crop: Crop) -> RenderOutputs:
-        rendered, alpha = self._render(**self._arguments, crop=crop)
-        return _split_render_outputs(rendered, alpha, self._num_channels)
+        full_image = tuple(crop) == (0, 0, self._tiles.image_width, self._tiles.image_height)
+        rendered, alphas = rasterize_world_space_gaussians(
+            self._model.means,
+            self._model.quats,
+            self._model.log_scales,
+            self._projected,
+            self._features,
+            self._opacities,
+            self._world_to_camera,
+            self._projection,
+            self._tiles,
+            distortion_coeffs=self._distortion_coeffs,
+            crop=None if full_image else crop,
+        )
+        return _split_render_outputs(rendered, alphas, self._num_channels)
 
     def finish_backward(self) -> None:
         self._shared.backward()
@@ -212,27 +237,24 @@ def _distinct_camera_batches(
     ``[1, 12]`` distortion coefficients and the image size the dataset delivers.
     """
     seen: set[int] = set()
-    for scene_idx in dataset.indices:
-        image_meta = dataset.sfm_scene.images[scene_idx]
-        camera_meta = image_meta.camera_metadata
-        camera_model = int(camera_meta.camera_model)
+    camera_models = dataset.camera_models
+    projections = dataset.projection_matrices
+    distortion = dataset.distortion_coeffs
+    sizes = dataset.image_sizes
+    for dataset_idx, scene_idx in enumerate(dataset.indices):
+        camera_model = int(camera_models[dataset_idx])
         if camera_model in seen:
             continue
         seen.add(camera_model)
-        # The camera metadata carries everything the probe needs, so no image is decoded.
-        world_to_camera = torch.from_numpy(image_meta.world_to_camera_matrix).float().unsqueeze(0).to(device)
-        projection = torch.from_numpy(camera_meta.projection_matrix).float().unsqueeze(0).to(device)
-        coeffs = (
-            camera_meta.distortion_coeffs if camera_meta.distortion_coeffs.size != 0 else np.zeros((12,), np.float32)
-        )
-        distortion_coeffs = torch.from_numpy(coeffs).float().unsqueeze(0).to(device)
-        # The dataset delivers patches no larger than patch_size, so the probe renders at that size.
-        width, height = _delivered_image_size(dataset, camera_meta.width, camera_meta.height)
+        # The dataset's own per-image arrays carry everything the probe needs, so no image is decoded.
+        world_to_camera = torch.from_numpy(dataset.sfm_scene.images[scene_idx].world_to_camera_matrix).float()
+        height, width = (int(v) for v in sizes[dataset_idx])
+        width, height = _delivered_image_size(dataset, width, height)
         yield (
             CameraModel(camera_model),
-            world_to_camera.contiguous(),
-            projection.contiguous(),
-            distortion_coeffs,
+            world_to_camera.unsqueeze(0).to(device).contiguous(),
+            torch.from_numpy(projections[dataset_idx]).float().unsqueeze(0).to(device).contiguous(),
+            torch.from_numpy(distortion[dataset_idx]).float().unsqueeze(0).to(device),
             width,
             height,
         )
@@ -390,6 +412,18 @@ class RenderBackend(Protocol):
         ...
 
 
+def _project_for_training(
+    model: GaussianSplat3d, config: "GaussianSplatReconstructionConfig", arguments: dict[str, Any]
+) -> ProjectedGaussianSplats:
+    """Project one camera batch, with the depth channel when a depth term is on."""
+    projection_function = (
+        model.project_gaussians_for_images_and_depths
+        if _needs_depth_render(config)
+        else model.project_gaussians_for_images
+    )
+    return projection_function(**arguments)
+
+
 class _ModelRenderBackend:
     """
     Shared forward path of the backends that render a :class:`GaussianSplat3d`.
@@ -539,22 +573,13 @@ class ImageSpaceRenderBackend(_ModelRenderBackend):
             )
 
     def _probe(self, model, config, camera_model, arguments) -> None:
-        self._project(model, config, arguments)
-
-    @staticmethod
-    def _project(
-        model: GaussianSplat3d, config: "GaussianSplatReconstructionConfig", arguments: dict[str, Any]
-    ) -> ProjectedGaussianSplats:
-        projection_function = (
-            model.project_gaussians_for_images_and_depths
-            if _needs_depth_render(config)
-            else model.project_gaussians_for_images
-        )
-        return projection_function(**arguments)
+        _project_for_training(model, config, arguments)
 
     def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
         # Project once; the view keeps the tile intersection and opacities, so each crop only rasterizes.
-        return _ProjectedTrainingView(self._project(model, config, arguments), config.tile_size, model.num_channels)
+        return _ProjectedTrainingView(
+            _project_for_training(model, config, arguments), config.tile_size, model.num_channels
+        )
 
     def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:
         image, alpha = model.render_images(**arguments, tile_size=config.tile_size)
@@ -567,8 +592,8 @@ class WorldSpaceRenderBackend(_ModelRenderBackend):
 
     This backend uses the world-space FVDB rendering APIs directly. It avoids the explicit
     projected-gaussian intermediate used by the image-space backend while preserving the same
-    high-level interface expected by :class:`GaussianSplatReconstruction`. Each training crop is
-    rendered on its own, since there is no per-view work to share between crops.
+    high-level interface expected by :class:`GaussianSplatReconstruction`. For training, the projection,
+    features, opacities and tiles of a view are computed once and every crop rasterizes from them.
     """
 
     def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
@@ -586,9 +611,15 @@ class WorldSpaceRenderBackend(_ModelRenderBackend):
         self._render_function(model, config)(**arguments, tile_size=config.tile_size)
 
     def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
-        render = self._render_function(model, config)
+        # The shared stages run once here; each crop only rasterizes, as in image space.
         return _WorldSpaceTrainingView(
-            lambda **kwargs: render(**kwargs, tile_size=config.tile_size), arguments, model.num_channels
+            model,
+            _project_for_training(model, config, arguments),
+            arguments["world_to_camera_matrices"],
+            arguments["projection_matrices"],
+            arguments["distortion_coeffs"],
+            config.tile_size,
+            model.num_channels,
         )
 
     def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:

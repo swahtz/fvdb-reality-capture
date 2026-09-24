@@ -33,11 +33,12 @@ def requires_distortion_coeffs(camera_model: CameraModel) -> bool:
 
 def check_distortion_coeffs(
     distortion_coeffs: torch.Tensor | None, camera_model: CameraModel, num_cameras: int, device: torch.device
-) -> None:
+) -> torch.Tensor | None:
     """Check packed distortion coefficients for a camera batch before a kernel reads them.
 
-    The kernels read twelve coefficients per camera, so anything else is rejected here rather than
-    rendering wrong pixels or tripping a device assert.
+    Pinhole and orthographic cameras ignore the coefficients, so for them ``None`` is returned whatever was
+    passed. For the distortion models the kernels read twelve coefficients per camera, so anything else
+    is rejected here rather than rendering wrong pixels or tripping a device assert.
 
     Args:
         distortion_coeffs (torch.Tensor | None): Packed coefficients, ``[C, 12]``, or ``None``.
@@ -45,20 +46,25 @@ def check_distortion_coeffs(
         num_cameras (int): ``C``.
         device (torch.device): Device of the Gaussians and cameras.
 
+    Returns:
+        distortion_coeffs (torch.Tensor | None): The coefficients the kernel should receive: ``None`` for
+            camera models without distortion, the validated tensor otherwise.
+
     Raises:
-        RuntimeError: If a distortion camera model has no coefficients, or the tensor is not a contiguous
+        RuntimeError: If a distortion camera model has no coefficients, or its tensor is not a contiguous
             ``[C, 12]`` tensor on ``device``.
     """
+    if not requires_distortion_coeffs(camera_model):
+        return None
     if distortion_coeffs is None:
-        if requires_distortion_coeffs(camera_model):
-            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
-        return
+        raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
     if list(distortion_coeffs.shape) != [num_cameras, 12]:
         raise RuntimeError(f"distortionCoeffs must have shape ({num_cameras}, 12)")
     if not distortion_coeffs.is_contiguous():
         raise RuntimeError("distortionCoeffs must be contiguous")
     if distortion_coeffs.device != device:
         raise RuntimeError(f"distortionCoeffs must be on {device}, got {distortion_coeffs.device}")
+    return distortion_coeffs
 
 
 def resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
@@ -142,7 +148,7 @@ def project_gaussians(
         raise RuntimeError("worldToCameraMatrices must be contiguous")
     camera_model = CameraModel(camera_model)
     num_cameras = world_to_camera_matrices.size(0)
-    check_distortion_coeffs(distortion_coeffs, camera_model, num_cameras, means.device)
+    distortion_coeffs = check_distortion_coeffs(distortion_coeffs, camera_model, num_cameras, means.device)
 
     resolved = resolve_projection_method(camera_model, projection_method)
     if requires_distortion_coeffs(camera_model) and resolved != ProjectionMethod.UNSCENTED:

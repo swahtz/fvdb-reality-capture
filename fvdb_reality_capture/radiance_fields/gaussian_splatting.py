@@ -17,7 +17,6 @@ from fvdb.types import DeviceIdentifier, cast_check, resolve_device
 from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
     Crop,
-    apply_pixel_mask,
     GaussianTileIntersection,
     ProjectedGaussians,
     as_pixel_jagged,
@@ -2082,8 +2081,9 @@ class GaussianSplat3d:
 
             The output always has the requested crop size. Where the crop runs past the image boundary,
             the part inside the image is rendered and the rest is filled with the background at zero
-            alpha; a crop that lies entirely outside the image is all background. Either way the output
-            is differentiable with respect to the projection whenever the projection is.
+            alpha; a crop that lies entirely outside the image is all background. The stage function
+            returns the clipped part only (empty for a crop entirely outside); this method pads it. Either
+            way the output is differentiable with respect to the projection whenever the projection is.
 
 
         Example:
@@ -2173,49 +2173,33 @@ class GaussianSplat3d:
             tile_size = tiles.tile_size
         elif tile_size is None:
             tile_size = 16
-        outside = origin_w >= width or origin_h >= height
         crop = None
-        if is_crop and not outside:
-            # Clips the crop at the image edge; the clipped part is padded back below.
-            crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
-        if is_crop and masks is not None:
-            # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
-            # else (a full-image mask, say) would silently be read from its top-left corner.
-            accepted = {(requested_h, requested_w)}
-            if crop is not None:
-                accepted.add((crop[3], crop[2]))
-            if masks.device != projected.means2d.device:
-                raise ValueError(f"masks must be on {projected.means2d.device}, got {masks.device}")
-            mask_shape = tuple(masks.shape[-2:])
-            if mask_shape not in accepted:
-                raise ValueError(
-                    f"masks must match the crop {(requested_h, requested_w)}"
-                    + (f" or its clipped size {(crop[3], crop[2])}" if crop is not None else "")
-                    + f", got {mask_shape}"
-                )
-        if outside:
-            # Entirely outside the image: nothing to rasterize, so the crop is all background at zero alpha.
-            # The empty render is sliced from the features rather than allocated, so the output stays
-            # connected to the projection, with zero gradient, whenever the projection is differentiable.
-            empty = pg.render_quantities[:, :0].reshape(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
-            return pad_crop(empty, empty[..., :1], requested_h, requested_w, backgrounds)
-        crop_masks = None
-        if crop is not None and masks is not None:
-            # The mask is in crop coordinates, so it is applied to the sliced render below rather than
-            # embedded in a full-image mask for the stage function.
-            crop_masks = masks[:, : crop[3], : crop[2]].bool()
+        if is_crop:
+            # The stage function clips the crop at the image edge (to nothing, if it lies entirely outside)
+            # and returns the clipped part; it is padded back below, so the output has the requested size.
+            crop = (origin_w, origin_h, crop_w, crop_h)
+            clipped = validate_crop(crop, width, height)
+            if masks is not None:
+                # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
+                # else (a full-image mask, say) would silently be read from its top-left corner.
+                if masks.device != projected.means2d.device:
+                    raise ValueError(f"masks must be on {projected.means2d.device}, got {masks.device}")
+                mask_shape = tuple(masks.shape[-2:])
+                if mask_shape not in ((requested_h, requested_w), (clipped[3], clipped[2])):
+                    raise ValueError(
+                        f"masks must match the crop {(requested_h, requested_w)} or its clipped size "
+                        f"{(clipped[3], clipped[2])}, got {mask_shape}"
+                    )
+                masks = masks[:, : clipped[3], : clipped[2]]
         images, alphas = rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
             pg.opacities,
             tiles if tiles is not None else pg.tile_intersection(tile_size),
             backgrounds=backgrounds,
-            masks=masks if crop is None else None,
+            masks=masks,
             crop=crop,
         )
-        if crop_masks is not None:
-            images, alphas = apply_pixel_mask(images, alphas, crop_masks, backgrounds)
-        # A crop that ran past the image edge keeps its requested size, with the outside as background.
         return pad_crop(images, alphas, requested_h, requested_w, backgrounds)
 
     def render_depths(

@@ -222,6 +222,19 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
             F.rasterize_world_space_gaussians(*world_args, distortion_coeffs=torch.zeros(self.C, 5, device=self.device))
         with self.assertRaisesRegex(RuntimeError, "must be on"):
             F.rasterize_world_space_gaussians(*world_args, distortion_coeffs=torch.zeros(self.C, 12))
+        # Pinhole cameras ignore the coefficients, whatever is passed.
+        F.rasterize_world_space_gaussians(
+            means,
+            quats,
+            log_scales,
+            projected,
+            features.detach(),
+            opacities.detach(),
+            self.w2c,
+            self.K,
+            tiles,
+            distortion_coeffs=torch.zeros(self.C, 5),
+        )
 
         params_oo = self._params()
         images_oo, alphas_oo = self._model(params_oo).render_images_from_world(
@@ -243,7 +256,8 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
         # carries the gradient the unscented kernel cannot provide.
         depth = F.evaluate_gaussian_sh(means, sh0, shN, self.w2c, projected, render_mode=GaussianRenderMode.DEPTH)
         self.assertTrue(depth.requires_grad)
-        visible = analytic.radii.amin(-1) > 0
+        # Each projection zeroes the depth of what it culls, and the two cull slightly differently.
+        visible = (analytic.radii.amin(-1) > 0) & (projected.radii.amin(-1) > 0)
         torch.testing.assert_close(depth[..., 0][visible], analytic.depths[visible], atol=1e-4, rtol=1e-4)
         depth.sum().backward()
         self.assertGreater(float(means.grad.abs().max()), 0.0)
@@ -357,9 +371,12 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             projected, features, opacities, tiles, crop=(self.W - 10, self.H - 5, 100, 100)
         )
         self.assertEqual(tuple(clamped.shape[1:3]), (5, 10))
-        for bad in ((-1, 0, 10, 10), (0, 0, 0, 10), (self.W, 0, 10, 10)):
+        for bad in ((-1, 0, 10, 10), (0, 0, 0, 10)):
             with self.assertRaises(ValueError):
                 F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, crop=bad)
+        # A crop entirely outside the image clips to nothing rather than raising.
+        empty, _ = F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, crop=(self.W, 0, 10, 10))
+        self.assertEqual(tuple(empty.shape), (self.C, 0, 0, 3))
 
         # The OO crop path agrees, including a mask given in crop coordinates.
         model = self._model(params)
@@ -401,10 +418,17 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             projected, features, opacities, tiles, masks=float_mask, crop=(ox, oy, w, h)
         )
         torch.testing.assert_close(with_float, crop, atol=1e-5, rtol=1e-5)
-        # A mask of the wrong size is rejected rather than read from its top-left corner: the stage
-        # function wants a full-image mask, the class method a crop-sized one.
-        with self.assertRaisesRegex(ValueError, "full-image"):
-            F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, masks=mask, crop=(ox, oy, w, h))
+        # With a crop the stage also takes a crop-sized mask, and pools the skipped tiles from it.
+        stage_masked, _ = F.rasterize_screen_space_gaussians(
+            projected, features, opacities, tiles, masks=mask, crop=(ox, oy, w, h)
+        )
+        torch.testing.assert_close(stage_masked, masked, atol=1e-5, rtol=1e-5)
+        # A mask of any other size is rejected rather than read from its top-left corner; the class
+        # method takes the requested or the clipped crop size only.
+        with self.assertRaisesRegex(ValueError, "full-image mask .* or a crop mask"):
+            F.rasterize_screen_space_gaussians(
+                projected, features, opacities, tiles, masks=mask[:, :-1], crop=(ox, oy, w, h)
+            )
         with self.assertRaisesRegex(ValueError, "match the crop"):
             model.render_from_projected_gaussians(
                 pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=float_mask
@@ -602,6 +626,16 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             images, alphas = model.render_from_projected_gaussians(pg, **outside)
         self.assertFalse(images.requires_grad)
         self.assertFalse(alphas.requires_grad)
+        # The stage function has the same contract minus the padding: an all-outside crop is empty.
+        empty, empty_alpha = F.rasterize_screen_space_gaussians(
+            pg.projected_gaussians,
+            pg.render_quantities,
+            pg.opacities,
+            pg.tile_intersection(16),
+            crop=(self.W, 0, 10, 10),
+        )
+        self.assertEqual(tuple(empty.shape), (self.C, 0, 0, 3))
+        self.assertEqual(tuple(empty_alpha.shape), (self.C, 0, 0, 1))
         # A mask of the wrong shape is rejected for an outside crop just as for any other crop.
         bad_mask = torch.ones(self.C, 3, 3, dtype=torch.bool, device=self.device)
         with self.assertRaisesRegex(ValueError, "masks must match"):
@@ -720,8 +754,8 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         model = self._model(params)
         w2c = self.w2c.clone().requires_grad_(True)  # stands in for pose-adjusted cameras
         with mock.patch.object(
-            GaussianSplat3d, "render_images_from_world", wraps=model.render_images_from_world
-        ) as render:
+            GaussianSplat3d, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+        ) as project:
             camera_models, distortion_coeffs = self._camera_batch(CameraModel.PINHOLE)
             view = WorldSpaceRenderBackend().forward_train(
                 model=model,
@@ -735,19 +769,22 @@ class TestRenderBackends(FunctionalPipelineTestCase):
                 sh_degree_to_use=self.sh_degree,
             )
             self.assertIsInstance(view, _WorldSpaceTrainingView)
-            self.assertEqual(render.call_count, 0)
-            # Each crop is its own render, and equals the slice of the full render.
+            # The projection, features and tiles are computed once; every crop rasterizes from them and
+            # equals the slice of the full render.
+            self.assertEqual(project.call_count, 1)
             self._assert_crops_are_slices(view)
+            self.assertEqual(project.call_count, 1)
             gt = torch.zeros(self.C, self.H, self.W, 3)
             for _, _, crop, _ in crop_image_batch(gt, None, 2):
                 view.render_crop(crop).image.sum().backward()
-                # There is no shared render: every crop's backward reaches the Gaussians on its own.
+                # The world-space rasterizer reaches the 3D parameters directly, crop by crop.
                 self.assertGreater(float(params[0].grad.abs().max()), 0.0)
-            self.assertTrue(all(call.kwargs["crop"] is not None for call in render.call_args_list[-4:]))
-        # The camera matrices are shared by the crops, so their gradient arrives once, at the end.
+        # Features and camera matrices are shared by the crops, so their gradients arrive once, at the end.
         self.assertIsNone(w2c.grad)
+        self.assertIsNone(params[4].grad)
         view.finish_backward()
         self.assertIsNotNone(w2c.grad)
+        self.assertIsNotNone(params[4].grad)
 
     def test_world_space_training_keeps_the_refinement_accumulators_allocated(self):
         # Refinement reads the radius accumulator on every path, so world space must allocate it (zeroed)

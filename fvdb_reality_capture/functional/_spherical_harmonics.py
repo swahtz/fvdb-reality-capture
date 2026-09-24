@@ -43,8 +43,8 @@ def evaluate_gaussian_sh(
     view-space depth of each Gaussian center, computed here from ``means`` and ``world_to_camera_matrices``
     so that the result is the same function of its inputs under either projection and with or without
     autograd, and so its backward is an elementwise product rather than the projection's full backward
-    kernel (the unscented projection has none). It equals ``projected.depths`` for every Gaussian the
-    projection kept; the projection zeroes the depth of Gaussians it culled, which are not rasterized.
+    kernel (the unscented projection has none). It equals ``projected.depths``, zero for culled Gaussians
+    included.
 
     Args:
         means (torch.Tensor): Gaussian centers in world space, ``[N, 3]``.
@@ -67,7 +67,10 @@ def evaluate_gaussian_sh(
         # an elementwise product and a sum rather than the analytic projection's full backward kernel.
         rotation_z = world_to_camera_matrices[:, 2, :3]  # [C, 3]
         translation_z = world_to_camera_matrices[:, 2, 3:4]  # [C, 1]
-        depths = ((rotation_z.unsqueeze(1) * means.unsqueeze(0)).sum(-1) + translation_z).unsqueeze(-1)  # [C, N, 1]
+        depths = (rotation_z.unsqueeze(1) * means.unsqueeze(0)).sum(-1) + translation_z  # [C, N]
+        # Culled Gaussians get zero depth, as the projection and the feature kernel give them.
+        visible = (projected.radii > 0).all(-1)
+        depths = (depths * visible.to(depths.dtype)).unsqueeze(-1)  # [C, N, 1]
     if render_mode == GaussianRenderMode.DEPTH:
         return depths
 
