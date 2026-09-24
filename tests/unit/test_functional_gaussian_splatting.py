@@ -576,6 +576,13 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
             images, alphas = model.render_from_projected_gaussians(pg, **outside)
         self.assertFalse(images.requires_grad)
         self.assertFalse(alphas.requires_grad)
+        # A mask of the wrong shape is rejected for an outside crop just as for any other crop.
+        bad_mask = torch.ones(self.C, 3, 3, dtype=torch.bool, device=self.device)
+        with self.assertRaisesRegex(ValueError, "masks must match"):
+            model.render_from_projected_gaussians(pg, masks=bad_mask, **outside)
+        good_mask = torch.ones(self.C, 10, 10, dtype=torch.bool, device=self.device)
+        images, _ = model.render_from_projected_gaussians(pg, masks=good_mask, **outside)
+        self.assertEqual(tuple(images.shape), (self.C, 10, 10, 3))
 
     def test_empty_selection(self):
         params = self._params()
@@ -650,8 +657,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         gt = torch.zeros(self.C, self.H, self.W, 3)
         for _, _, crop, _ in crop_image_batch(gt, None, crops):
             out = view.render_crop(crop)
-            # Mean losses per crop, weighted by the crop's share of the image as the training loop does,
-            # so the crops add up to exactly the full-image mean loss.
+            # Per-pixel mean losses per crop, weighted by the crop's share of the image as the training loop
+            # does, so the crops add up to exactly the full-image mean loss. SSIM is left out on purpose: its
+            # windows see zero padding at crop seams, so it is not crop-additive.
             weight = crop_loss_weight(crop, self.H, self.W)
             ((out.image.square().mean() + out.alpha.mean()) * weight).backward()
         # Nothing reaches the model until the shared backward runs once.
@@ -751,6 +759,7 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         pinhole_view.render_crop(full).image.sum().backward()
         pinhole_view.finish_backward()
         norms_after_pinhole = model.accumulated_mean_2d_gradient_norms.clone()
+        counts_after_pinhole = model.accumulated_gradient_step_counts.clone()
         self.assertGreater(float(norms_after_pinhole.sum()), 0.0)
         means_grad_after_pinhole = params[0].grad.clone()
 
@@ -759,7 +768,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         opencv_view.render_crop(full).image.sum().backward()
         opencv_view.finish_backward()
         self.assertFalse(torch.equal(params[0].grad, means_grad_after_pinhole), "world space trained the geometry")
+        # World-space views project without the accumulators, so neither the norms nor the step counts move.
         torch.testing.assert_close(model.accumulated_mean_2d_gradient_norms, norms_after_pinhole)
+        self.assertTrue(torch.equal(model.accumulated_gradient_step_counts, counts_after_pinhole))
 
     def test_routed_validation_reports_forward_only_cameras_and_pure_image_space_rejects_them(self):
         model = self._model(self._params())
@@ -838,6 +849,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         without, _ = model.render_from_projected_gaussians(pg, **crop)
         with_tiles, _ = model.render_from_projected_gaussians(pg, tiles=pg_tiles, **crop)
         torch.testing.assert_close(with_tiles, without)
+        # Tiles binned at another size are refused rather than the tile_size argument being ignored.
+        with self.assertRaisesRegex(ValueError, "tile_size"):
+            model.render_from_projected_gaussians(pg, tiles=pg_tiles, tile_size=8, **crop)
 
 
 if __name__ == "__main__":

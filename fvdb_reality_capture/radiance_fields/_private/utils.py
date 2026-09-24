@@ -53,8 +53,9 @@ def crop_loss_weight(crop: tuple[int, int, int, int], image_height: int, image_w
     The share of an image's pixels that a crop covers.
 
     Per-crop losses are means over the crop's own pixels. Weighting each by this share before backward makes
-    the crops of an image sum to the full-image loss, so the gradient (and the densification statistics it
-    feeds) is the same whether the image is rendered whole or in crops.
+    the per-pixel losses of an image's crops sum to the full-image loss, so their gradient (and the
+    densification statistics it feeds) is the same whether the image is rendered whole or in crops. SSIM is
+    not per pixel; computed per crop it differs from the whole-image value along crop seams.
 
     Args:
         crop (tuple[int, int, int, int]): The crop as ``(x, y, w, h)``, as yielded by :func:`crop_image_batch`.

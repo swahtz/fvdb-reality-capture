@@ -1483,9 +1483,18 @@ class GaussianSplat3d:
         min_radius_2d: float,
         eps_2d: float,
         antialias: bool,
+        accumulate_statistics: bool = True,
     ) -> ProjectedGaussians:
-        """Stage 1 for this model's Gaussians, wiring in the densification accumulators."""
-        grad_norms, step_counts, max_radii = self._projection_accumulators()
+        """Stage 1 for this model's Gaussians.
+
+        With ``accumulate_statistics`` the enabled densification accumulators are wired into the projection,
+        so its backward records the 2D mean gradients and radii. World-space rasterization does not
+        differentiate through the projected means, so it projects without them and leaves the statistics
+        to the image-space views.
+        """
+        grad_norms, step_counts, max_radii = (
+            self._projection_accumulators() if accumulate_statistics else (None, None, None)
+        )
         return project_gaussians(
             self._means,
             self._quats,
@@ -1521,6 +1530,7 @@ class GaussianSplat3d:
         min_radius_2d: float,
         eps_2d: float,
         antialias: bool,
+        accumulate_statistics: bool = True,
     ) -> tuple[ProjectedGaussians, torch.Tensor]:
         """Stage 1 plus the per-camera opacities every later stage takes, computed once."""
         projected = self._project(
@@ -1536,6 +1546,7 @@ class GaussianSplat3d:
             min_radius_2d,
             eps_2d,
             antialias,
+            accumulate_statistics,
         )
         return projected, compute_gaussian_opacities(self._logit_opacities, projected)
 
@@ -1619,7 +1630,7 @@ class GaussianSplat3d:
         world_space: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All four stages for dense images, in screen space or world space."""
-        projected = self._project(
+        projected, opacities = self._project_and_opacities(
             world_to_camera_matrices,
             projection_matrices,
             image_width,
@@ -1632,9 +1643,9 @@ class GaussianSplat3d:
             min_radius_2d,
             eps_2d,
             antialias,
+            accumulate_statistics=not world_space,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
-        opacities = compute_gaussian_opacities(self._logit_opacities, projected)
         tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
         if world_space:
             return rasterize_world_space_gaussians(
@@ -1677,7 +1688,7 @@ class GaussianSplat3d:
         render_mode: GaussianRenderMode,
     ) -> tuple[JaggedTensor, JaggedTensor]:
         """All four stages for an arbitrary set of pixels, in the requested pixel order."""
-        projected = self._project(
+        projected, opacities = self._project_and_opacities(
             world_to_camera_matrices,
             projection_matrices,
             image_width,
@@ -1692,7 +1703,6 @@ class GaussianSplat3d:
             antialias,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
-        opacities = compute_gaussian_opacities(self._logit_opacities, projected)
         sparse_tiles = intersect_gaussian_tiles_sparse(
             pixels_to_render, projected, tile_size=tile_size, opacities=opacities
         )
@@ -2151,27 +2161,36 @@ class GaussianSplat3d:
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
         requested_h, requested_w = crop_h, crop_w
-        if origin_w >= width or origin_h >= height:
+        if tiles is not None and tiles.tile_size != tile_size:
+            raise ValueError(f"tiles were computed at tile_size {tiles.tile_size}, not the requested {tile_size}")
+        outside = origin_w >= width or origin_h >= height
+        crop = None
+        if is_crop and not outside:
+            # Clips the crop at the image edge; the clipped part is padded back below.
+            crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
+        if is_crop and masks is not None:
+            # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
+            # else (a full-image mask, say) would silently be read from its top-left corner.
+            accepted = {(requested_h, requested_w)}
+            if crop is not None:
+                accepted.add((crop[3], crop[2]))
+            mask_shape = tuple(masks.shape[-2:])
+            if mask_shape not in accepted:
+                raise ValueError(
+                    f"masks must match the crop {(requested_h, requested_w)}"
+                    + (f" or its clipped size {(crop[3], crop[2])}" if crop is not None else "")
+                    + f", got {mask_shape}"
+                )
+        if outside:
             # Entirely outside the image: nothing to rasterize, so the crop is all background at zero alpha.
             # The empty render is sliced from the features rather than allocated, so the output stays
             # connected to the projection, with zero gradient, whenever the projection is differentiable.
             empty = pg.render_quantities[:, :0].reshape(projected.num_cameras, 0, 0, pg.render_quantities.shape[-1])
             return pad_crop(empty, empty[..., :1], requested_h, requested_w, backgrounds)
-        crop = None
         full_masks = masks
-        if is_crop:
-            # Clips the crop at the image edge; the clipped part is padded back below.
-            crop = validate_crop((origin_w, origin_h, crop_w, crop_h), width, height)
+        if crop is not None:
             origin_w, origin_h, crop_w, crop_h = crop
             if masks is not None:
-                # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
-                # else (a full-image mask, say) would silently be read from its top-left corner.
-                mask_shape = tuple(masks.shape[-2:])
-                if mask_shape not in ((requested_h, requested_w), (crop_h, crop_w)):
-                    raise ValueError(
-                        f"masks must match the crop, {(requested_h, requested_w)} or its clipped size {(crop_h, crop_w)}, "
-                        f"got {mask_shape}"
-                    )
                 # Embed its clipped region in the full image.
                 full_masks = torch.zeros(projected.num_cameras, height, width, dtype=torch.bool, device=masks.device)
                 full_masks[:, origin_h : origin_h + crop_h, origin_w : origin_w + crop_w] = masks[

@@ -339,9 +339,12 @@ class GaussianSplatReconstructionConfig:
     Number of crops per side to split each image into during reconstruction, so ``2`` renders four crops.
     The Gaussians are projected once per image and every crop rasterizes from that projection, skipping
     tiles outside the crop. Each crop's loss is weighted by its share of the image before its backward, so
-    the crops sum to the full-image loss and training matches ``crops_per_image=1`` exactly; this setting
-    changes memory use, not the optimization. The raster output buffers are still allocated at full image
-    size (openvdb/fvdb-core#800), so it reduces peak memory less than the crop area alone would suggest.
+    the per-pixel terms (L1 and depth) sum to the full-image loss and the gradient reaches the shared
+    projection once, as with ``crops_per_image=1``. Two things differ from whole-image training: SSIM is
+    computed per crop with zero padding, so its windows along crop seams do not see the neighbouring crop,
+    and rows or columns left over when the image size is not divisible by this count are not supervised.
+    The raster output buffers are still allocated at full image size (openvdb/fvdb-core#800), so it
+    reduces peak memory less than the crop area alone would suggest.
 
     Default: ``1`` (no cropping, use full images).
     """
@@ -1596,9 +1599,9 @@ class GaussianSplatReconstruction:
                 # If self.optimization_config.crops_per_image is 1, then this just returns the image
                 #
                 # Every per-crop loss is a mean over the crop's own pixels or depth points, so each is weighted
-                # by the crop's share of the whole before backward. The crops then sum to the full-image loss,
-                # the shared backward sees the same gradient, and the densification statistics record the same
-                # sample, as a single crop would give. crops_per_image changes memory use, not the optimization.
+                # by the crop's share of the whole before backward. The per-pixel terms then sum to the
+                # full-image loss and the shared backward sees one gradient for the whole image; SSIM differs
+                # along crop seams and leftover rows or columns go unsupervised (see crops_per_image).
                 depth_targets = _DepthTargets(
                     sparse_depth=sparse_depth,
                     sparse_depth_uv=sparse_depth_uv,
