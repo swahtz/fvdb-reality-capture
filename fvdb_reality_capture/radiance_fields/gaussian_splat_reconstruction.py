@@ -25,7 +25,7 @@ from fvdb_reality_capture.sfm_scene import SfmScene
 from fvdb_reality_capture.tools import export_splats_to_usd
 
 from ..functional import Crop
-from ._gaussian_rendering import RenderBackend, TrainingView, make_render_backend
+from ._gaussian_rendering import RenderBackend, TrainingView, resolve_render_backend
 from ._gaussian_splat_viz import gaussian_splat_to_view_data
 from ._private.lpips import LPIPSLoss
 from ._private.utils import crop_image_batch, crop_loss_weight
@@ -605,12 +605,15 @@ class GaussianSplatReconstructionConfig:
     """
     Rendering path to use during reconstruction, for training and evaluation alike.
 
-    ``"auto"`` chooses per camera batch. Batches whose camera has an analytic projection are projected and
-    rasterized in image space, which feeds the densification statistics. Batches whose camera needs the
-    unscented projection (the distortion camera models under ``projection_method="auto"``), which has no
-    backward pass, are rendered in world space so their geometry still receives a gradient. ``"image_space"``
-    uses the image-space path for every batch and refuses cameras it cannot train; ``"world_space"``
-    evaluates the 3D Gaussians along per-pixel rays for every batch.
+    A run uses one backend for every batch; the projection method may still differ between batches when
+    the scene holds several camera models (one model per batch). ``"image_space"`` projects the Gaussians
+    and rasterizes the projections, which feeds the densification statistics; it refuses cameras that need
+    the unscented projection (the distortion camera models under ``projection_method="auto"``), since that
+    projection has no backward pass and their geometry would not train. ``"world_space"`` evaluates the 3D
+    Gaussians along per-pixel rays and differentiates through them directly, at the cost of the
+    densification statistics and of any gradient to the camera matrices. ``"auto"`` picks ``"image_space"``
+    unless the scene has a camera that needs the unscented projection, in which case it picks
+    ``"world_space"`` and logs why.
 
     Default: ``"auto"``
     """
@@ -758,9 +761,6 @@ class GaussianSplatReconstruction:
         model = GaussianSplatReconstruction._init_model(config, optimizer_config, device, train_dataset)
         logger.info(f"Model initialized with {model.num_gaussians:,} Gaussians")
 
-        # The constructor validates the backend against the scene's cameras.
-        render_backend = make_render_backend(config.render_backend)
-
         # Initialize optimizer
         max_steps = config.max_epochs * len(train_dataset)
         optimizer = optimizer_config.make_optimizer(model=model, sfm_scene=train_dataset.sfm_scene)
@@ -793,7 +793,6 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
-            render_backend=render_backend,
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -957,7 +956,6 @@ class GaussianSplatReconstruction:
             viz_scene=viz_scene,
             log_interval_steps=log_interval_steps,
             viz_update_interval_epochs=viz_update_interval_epochs,
-            render_backend=make_render_backend(config.render_backend),
             _private=GaussianSplatReconstruction.__PRIVATE__,
         )
 
@@ -977,7 +975,6 @@ class GaussianSplatReconstruction:
         viz_scene: Scene | None,
         log_interval_steps: int,
         viz_update_interval_epochs: float,
-        render_backend: RenderBackend,
         _private: object | None = None,
     ) -> None:
         """
@@ -1019,7 +1016,6 @@ class GaussianSplatReconstruction:
         self._pose_adjust_scheduler = pose_adjust_scheduler
         self._start_step = start_step
         self._viz_update_interval_epochs = viz_update_interval_epochs
-        self._render_backend = render_backend
 
         self._sfm_scene = sfm_scene
 
@@ -1063,6 +1059,8 @@ class GaussianSplatReconstruction:
         self._validation_dataset = SfmDataset(sfm_scene=sfm_scene, dataset_indices=val_indices)
 
         self.device: torch.device = model.device
+        # One backend for the whole run, chosen from the config and the scene's cameras, then checked against them.
+        self._render_backend: RenderBackend = resolve_render_backend(self._cfg, self._training_dataset)
         self._render_backend.validate_scene_cameras(self._model, self._training_dataset, self._cfg, self.device)
         _check_crop_size(
             self._training_dataset.image_sizes, self._cfg.crops_per_image, self._training_dataset.patch_size

@@ -558,8 +558,7 @@ class ImageSpaceRenderBackend(_ModelRenderBackend):
     rendering path and for renderers that need projected-gaussian intermediates during training.
 
     It cannot train cameras that need the unscented projection, which has no backward pass;
-    :class:`RoutedRenderBackend` (``render_backend="auto"``) sends those batches to
-    :class:`WorldSpaceRenderBackend` instead.
+    ``render_backend="auto"`` chooses :class:`WorldSpaceRenderBackend` for a scene with such cameras.
     """
 
     def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
@@ -569,7 +568,7 @@ class ImageSpaceRenderBackend(_ModelRenderBackend):
         if forward_only:
             raise ValueError(
                 _forward_only_explanation(forward_only, config)
-                + ' Use render_backend="auto", which renders those cameras in world space, or "world_space".'
+                + ' Use render_backend="world_space" (what "auto" chooses for this scene), or undistort the images.'
             )
 
     def _probe(self, model, config, camera_model, arguments) -> None:
@@ -627,65 +626,45 @@ class WorldSpaceRenderBackend(_ModelRenderBackend):
         return RenderOutputs(image=image, alpha=alpha)
 
 
-class RoutedRenderBackend(_ModelRenderBackend):
-    """
-    Image space where it can train, world space where it must, chosen per camera batch.
-
-    Batches whose camera has an analytic projection go to :class:`ImageSpaceRenderBackend`. Batches
-    whose camera resolves to the unscented projection, which has no backward pass, go to
-    :class:`WorldSpaceRenderBackend`, which differentiates through the 3D parameters directly. The
-    same choice is made for training and evaluation, so the renderer being measured is the one being
-    optimized. Because it is per batch, a scene that mixes pinhole and distortion cameras keeps its
-    pinhole views in image space, and they keep feeding the densification statistics, which only the
-    analytic projection's backward produces. This is what ``render_backend="auto"`` selects.
-    """
-
-    def __init__(self) -> None:
-        self._image_space = ImageSpaceRenderBackend()
-        self._world_space = WorldSpaceRenderBackend()
-
-    def _backend_for(
-        self, camera_model: CameraModel, config: "GaussianSplatReconstructionConfig"
-    ) -> _ModelRenderBackend:
-        projection_method = projection_method_from_config(config.projection_method)
-        if resolve_projection_method(camera_model, projection_method) == ProjectionMethod.UNSCENTED:
-            return self._world_space
-        return self._image_space
-
-    def _validate_camera_models(self, dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
-        # Camera models that will render in world space are logged once, since views from them add
-        # nothing to the densification statistics.
-        forward_only = _forward_only_camera_models(dataset, config)
-        if forward_only:
-            _logger.warning(
-                _forward_only_explanation(forward_only, config)
-                + " Views from those cameras are rendered in world space, which differentiates through the 3D "
-                "parameters directly; views from other cameras stay in image space. Gaussian densification "
-                "statistics come only from image-space views."
-                + _pose_optimization_note(forward_only, config)
-                + " Undistort the images to train every view in image space."
-            )
-
-    def _probe(self, model, config, camera_model, arguments) -> None:
-        self._backend_for(camera_model, config)._probe(model, config, camera_model, arguments)
-
-    def _train_view(self, model, config, camera_model, arguments) -> TrainingView:
-        return self._backend_for(camera_model, config)._train_view(model, config, camera_model, arguments)
-
-    def _eval_render(self, model, config, camera_model, arguments) -> RenderOutputs:
-        return self._backend_for(camera_model, config)._eval_render(model, config, camera_model, arguments)
-
-
 def make_render_backend(name: RenderBackendName) -> RenderBackend:
-    """Return the backend a :class:`GaussianSplatReconstructionConfig` ``render_backend`` value names.
-
-    ``"auto"`` routes per camera batch: image space for cameras it can train, world space for the rest.
-    ``"image_space"`` and ``"world_space"`` are the pure backends.
-    """
-    if name == "auto":
-        return RoutedRenderBackend()
+    """Return the pure backend a ``render_backend`` value names; ``"auto"`` needs the scene, see :func:`resolve_render_backend`."""
     if name == "image_space":
         return ImageSpaceRenderBackend()
     if name == "world_space":
         return WorldSpaceRenderBackend()
+    if name == "auto":
+        raise ValueError('render_backend="auto" is resolved against the scene by resolve_render_backend')
     raise ValueError(f"Unsupported render_backend {name}")
+
+
+def resolve_render_backend(config: "GaussianSplatReconstructionConfig", dataset: SfmDataset) -> RenderBackend:
+    """Choose the one backend a reconstruction run uses, from its config and the scene's cameras.
+
+    A run renders every batch with the same backend. ``"auto"`` picks image space, which feeds the
+    densification statistics, unless some camera in the scene resolves to the unscented projection,
+    which has no backward pass; then the whole run renders in world space so that geometry still
+    receives a gradient, and the choice and its consequences are logged once. The explicit names are
+    returned as they are, and validation decides whether the scene suits them.
+
+    Args:
+        config (GaussianSplatReconstructionConfig): Reconstruction config; reads ``render_backend``,
+            ``projection_method`` and ``optimize_camera_poses``.
+        dataset (SfmDataset): The training dataset whose camera models decide ``"auto"``.
+
+    Returns:
+        RenderBackend: The backend for the run.
+    """
+    if config.render_backend != "auto":
+        return make_render_backend(config.render_backend)
+    forward_only = _forward_only_camera_models(dataset, config)
+    if not forward_only:
+        return ImageSpaceRenderBackend()
+    _logger.warning(
+        _forward_only_explanation(forward_only, config)
+        + " The run renders every view in world space, which differentiates through the 3D parameters "
+        "directly; Gaussian densification statistics, which only image-space views produce, are unavailable, "
+        "so gradient-driven duplication and splitting are skipped."
+        + _pose_optimization_note(forward_only, config)
+        + " Undistort the images to train in image space."
+    )
+    return WorldSpaceRenderBackend()

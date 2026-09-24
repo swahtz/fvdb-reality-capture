@@ -21,11 +21,11 @@ import fvdb_reality_capture.functional as F
 from fvdb_reality_capture import CameraModel, GaussianRenderMode, GaussianSplat3d, ProjectionMethod
 from fvdb_reality_capture.radiance_fields._gaussian_rendering import (
     ImageSpaceRenderBackend,
-    RoutedRenderBackend,
     WorldSpaceRenderBackend,
     _ProjectedTrainingView,
     _WorldSpaceTrainingView,
     make_render_backend,
+    resolve_render_backend,
 )
 from fvdb_reality_capture.radiance_fields._private.utils import crop_image_batch, crop_loss_weight
 from fvdb_reality_capture.radiance_fields.gaussian_splat_reconstruction import (
@@ -854,96 +854,66 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         del held
         self.assertIsNone(copy())
 
-    def test_image_space_backend_renders_forward_only_camera_batches_through_world_space(self):
-        # In a scene that mixes pinhole and distortion cameras, the pinhole batches keep image space and
-        # keep feeding the densification statistics, while the distortion batches take the world-space
-        # path so their geometry still gets a gradient.
-        params = self._params(requires_grad=True)
-        model = self._model(params)
-        model.accumulate_mean_2d_gradients = True
-        backend = make_render_backend("auto")
-        self.assertIsInstance(backend, RoutedRenderBackend)
+    def test_auto_resolves_to_one_backend_for_the_run(self):
+        module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
         config = GaussianSplatReconstructionConfig()
-        full = (0, 0, self.W, self.H)
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
+        mixed = mock.MagicMock(
+            camera_models=np.array([int(CameraModel.PINHOLE), int(CameraModel.OPENCV_RADTAN_5)]), indices=[]
+        )
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            self.assertIsInstance(resolve_render_backend(config, pinhole), ImageSpaceRenderBackend)
+        # Any camera that needs the unscented projection sends the whole run to world space, with a log
+        # that names the camera, the lost densification statistics and (poses being optimized) the
+        # missing camera gradient.
+        for scene in (opencv, mixed):
+            with self.assertLogs(module_logger, level="WARNING") as logs:
+                self.assertIsInstance(resolve_render_backend(config, scene), WorldSpaceRenderBackend)
+            self.assertIn("OPENCV_RADTAN_5", logs.output[0])
+            self.assertIn("world space", logs.output[0])
+            self.assertIn("densification", logs.output[0].lower())
+            self.assertIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING") as logs:
+            resolve_render_backend(GaussianSplatReconstructionConfig(optimize_camera_poses=False), opencv)
+        self.assertNotIn("pose optimization", logs.output[0].lower())
+        with self.assertLogs(module_logger, level="WARNING"):
+            self.assertIsInstance(
+                resolve_render_backend(GaussianSplatReconstructionConfig(projection_method="unscented"), pinhole),
+                WorldSpaceRenderBackend,
+            )
+        # Explicit names pass through untouched; "auto" alone cannot be built without a scene.
+        self.assertIsInstance(
+            resolve_render_backend(GaussianSplatReconstructionConfig(render_backend="world_space"), pinhole),
+            WorldSpaceRenderBackend,
+        )
+        self.assertIsInstance(make_render_backend("image_space"), ImageSpaceRenderBackend)
+        with self.assertRaisesRegex(ValueError, "resolve_render_backend"):
+            make_render_backend("auto")
 
-        pinhole_view = self._forward_train(backend, model, config)
-        self.assertIsInstance(pinhole_view, _ProjectedTrainingView)
-        pinhole_view.render_crop(full).image.sum().backward()
-        pinhole_view.finish_backward()
-        norms_after_pinhole = model.accumulated_mean_2d_gradient_norms.clone()
-        counts_after_pinhole = model.accumulated_gradient_step_counts.clone()
-        self.assertGreater(float(norms_after_pinhole.sum()), 0.0)
-        means_grad_after_pinhole = params[0].grad.clone()
-
-        opencv_view = self._forward_train(backend, model, config, camera_model=CameraModel.OPENCV_RADTAN_5)
-        self.assertIsInstance(opencv_view, _WorldSpaceTrainingView)
-        opencv_view.render_crop(full).image.sum().backward()
-        opencv_view.finish_backward()
-        self.assertFalse(torch.equal(params[0].grad, means_grad_after_pinhole), "world space trained the geometry")
-        # World-space views project without the accumulators, so neither the norms nor the step counts move.
-        torch.testing.assert_close(model.accumulated_mean_2d_gradient_norms, norms_after_pinhole)
-        self.assertTrue(torch.equal(model.accumulated_gradient_step_counts, counts_after_pinhole))
-
-    def test_routed_validation_reports_forward_only_cameras_and_pure_image_space_rejects_them(self):
+    def test_pure_backends_validate_the_scene_they_are_given(self):
         model = self._model(self._params())
-        routed = make_render_backend("auto")
-        pure = ImageSpaceRenderBackend()
         module_logger = "fvdb_reality_capture.radiance_fields._gaussian_rendering"
         config = GaussianSplatReconstructionConfig()
         opencv = mock.MagicMock(camera_models=np.array([int(CameraModel.OPENCV_RADTAN_5)]), indices=[])
-        with self.assertLogs(module_logger, level="WARNING") as logs:
-            routed.validate_scene_cameras(model, opencv, config, self.device)
-        self.assertIn("OPENCV_RADTAN_5", logs.output[0])
-        self.assertIn("world space", logs.output[0])
-        self.assertIn("densification", logs.output[0].lower())
-        # The default config optimizes poses, and world space gives the camera matrices no gradient.
-        self.assertIn("pose optimization", logs.output[0].lower())
-        with self.assertLogs(module_logger, level="WARNING") as logs:
-            routed.validate_scene_cameras(
-                model, opencv, GaussianSplatReconstructionConfig(optimize_camera_poses=False), self.device
+        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
+        # Image space refuses cameras whose geometry it cannot train, and points at world space.
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            ImageSpaceRenderBackend().validate_scene_cameras(model, opencv, config, self.device)
+        with self.assertRaisesRegex(ValueError, "world_space"):
+            ImageSpaceRenderBackend().validate_scene_cameras(
+                model, pinhole, GaussianSplatReconstructionConfig(projection_method="unscented"), self.device
             )
-        self.assertNotIn("pose optimization", logs.output[0].lower())
+        with self.assertNoLogs(module_logger, level="WARNING"):
+            ImageSpaceRenderBackend().validate_scene_cameras(model, pinhole, config, self.device)
+        # World space accepts every camera but says what pose optimization loses there.
         with self.assertLogs(module_logger, level="WARNING") as logs:
             WorldSpaceRenderBackend().validate_scene_cameras(model, opencv, config, self.device)
         self.assertIn("pose optimization", logs.output[0].lower())
-        with self.assertRaisesRegex(ValueError, "auto"):
-            pure.validate_scene_cameras(model, opencv, config, self.device)
-        self.assertIsInstance(make_render_backend("image_space"), ImageSpaceRenderBackend)
-        pinhole_unscented = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
-        unscented = GaussianSplatReconstructionConfig(projection_method="unscented")
-        with self.assertLogs(module_logger, level="WARNING"):
-            routed.validate_scene_cameras(model, pinhole_unscented, unscented, self.device)
-        with self.assertRaisesRegex(ValueError, "auto"):
-            pure.validate_scene_cameras(model, pinhole_unscented, unscented, self.device)
-        pinhole = mock.MagicMock(camera_models=np.array([int(CameraModel.PINHOLE)]), indices=[])
         with self.assertNoLogs(module_logger, level="WARNING"):
-            routed.validate_scene_cameras(model, pinhole, config, self.device)
-            pure.validate_scene_cameras(model, pinhole, config, self.device)
-
-    def test_routed_evaluation_uses_the_renderer_that_trains_each_camera(self):
-        model = self._model(self._params())
-        routed = make_render_backend("auto")
-        config = GaussianSplatReconstructionConfig()
-        for camera_model, reference in (
-            (CameraModel.OPENCV_RADTAN_5, WorldSpaceRenderBackend()),
-            (CameraModel.PINHOLE, ImageSpaceRenderBackend()),
-        ):
-            camera_models, distortion_coeffs = self._camera_batch(camera_model)
-            kwargs = dict(
-                model=model,
-                config=config,
-                world_to_camera_matrices=self.w2c,
-                projection_matrices=self.K,
-                camera_models=camera_models,
-                distortion_coeffs=distortion_coeffs,
-                image_width=self.W,
-                image_height=self.H,
-                sh_degree_to_use=self.sh_degree,
+            WorldSpaceRenderBackend().validate_scene_cameras(
+                model, opencv, GaussianSplatReconstructionConfig(optimize_camera_poses=False), self.device
             )
-            routed_eval = routed.forward_eval(**kwargs)
-            reference_eval = reference.forward_eval(**kwargs)
-            torch.testing.assert_close(routed_eval.image, reference_eval.image, atol=1e-5, rtol=1e-5)
-            torch.testing.assert_close(routed_eval.alpha, reference_eval.alpha, atol=1e-5, rtol=1e-5)
 
     def test_stale_tiles_are_rejected_and_precomputed_tiles_are_accepted(self):
         params = self._params()
