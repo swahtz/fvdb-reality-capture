@@ -275,6 +275,12 @@ def _probe_world_space_render(
     )
 
 
+def _check_camera_batching(dataset: SfmDataset, config: "GaussianSplatReconstructionConfig") -> None:
+    """Minibatches hold one camera model, so a multi-model scene can only be trained one image at a time."""
+    if config.batch_size > 1 and len(set(dataset.camera_models.tolist())) > 1:
+        raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+
+
 def _camera_model_from_batch(camera_models: torch.Tensor) -> CameraModel:
     unique_camera_models = torch.unique(camera_models.to(dtype=torch.int32))
     if unique_camera_models.numel() != 1:
@@ -415,8 +421,7 @@ class ImageSpaceRenderBackend:
             config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
             device (torch.device): Device on which validation probes should run.
         """
-        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
-            raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+        _check_camera_batching(dataset, config)
         forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
             raise ValueError(
@@ -614,8 +619,7 @@ class WorldSpaceRenderBackend:
             config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
             device (torch.device): Device on which validation probes should run.
         """
-        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
-            raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+        _check_camera_batching(dataset, config)
         with torch.no_grad():
             for camera_model, world_to_camera, projection, distortion_coeffs, width, height in _distinct_camera_batches(
                 dataset, device
@@ -823,8 +827,7 @@ class RoutedRenderBackend:
             config (GaussianSplatReconstructionConfig): Reconstruction config controlling render behavior.
             device (torch.device): Device on which validation probes should run.
         """
-        if config.batch_size > 1 and torch.unique(torch.from_numpy(dataset.camera_models)).numel() > 1:
-            raise NotImplementedError("batch_size > 1 is not supported for scenes with multiple camera models")
+        _check_camera_batching(dataset, config)
         forward_only = _forward_only_camera_models(dataset, config)
         if forward_only:
             _logger.warning(

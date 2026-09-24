@@ -2055,7 +2055,7 @@ class GaussianSplat3d:
         crop_height: int = -1,
         crop_origin_w: int = -1,
         crop_origin_h: int = -1,
-        tile_size: int = 16,
+        tile_size: int | None = None,
         backgrounds: torch.Tensor | None = None,
         masks: torch.Tensor | None = None,
         tiles: GaussianTileIntersection | None = None,
@@ -2129,13 +2129,13 @@ class GaussianSplat3d:
                 Default is -1.
             crop_origin_h (int): The y-coordinate of the top-left corner of the crop. If -1, the crop starts at (0, 0).
                 Default is -1.
-            tile_size (int): The size of the tiles to use for rendering. Default is 16.
-                This parameter controls the size of the tiles used for rendering the images.
-                You shouldn't set this parameter unless you really know what you are doing.
+            tile_size (int | None): The size of the tiles to use for rendering. Taken from ``tiles`` when
+                they are given, and 16 otherwise; passing both raises if they disagree. You shouldn't set
+                this parameter unless you really know what you are doing.
             backgrounds (torch.Tensor | None): Optional background colors of shape ``(C, D)``.
                 If ``None``, background is treated as 0.
             masks (torch.Tensor | None): Optional per-pixel boolean mask of shape ``(C, cropH, cropW)``
-                (in crop coordinate space, matching the output dimensions).
+                (in crop coordinate space, matching the output dimensions), on the projection's device.
                 ``True`` means render, ``False`` means skip (filled with background).
             tiles (GaussianTileIntersection | None): The tile intersections of ``projected_gaussians`` at
                 ``tile_size``, from :meth:`ProjectedGaussianSplats.tile_intersection`. Computed here when
@@ -2161,8 +2161,12 @@ class GaussianSplat3d:
         origin_h = crop_origin_h if crop_origin_h >= 0 else 0
         is_crop = crop_w != width or crop_h != height or origin_w != 0 or origin_h != 0
         requested_h, requested_w = crop_h, crop_w
-        if tiles is not None and tiles.tile_size != tile_size:
-            raise ValueError(f"tiles were computed at tile_size {tiles.tile_size}, not the requested {tile_size}")
+        if tiles is not None:
+            if tile_size is not None and tiles.tile_size != tile_size:
+                raise ValueError(f"tiles were computed at tile_size {tiles.tile_size}, not the requested {tile_size}")
+            tile_size = tiles.tile_size
+        elif tile_size is None:
+            tile_size = 16
         outside = origin_w >= width or origin_h >= height
         crop = None
         if is_crop and not outside:
@@ -2174,6 +2178,8 @@ class GaussianSplat3d:
             accepted = {(requested_h, requested_w)}
             if crop is not None:
                 accepted.add((crop[3], crop[2]))
+            if masks.device != projected.means2d.device:
+                raise ValueError(f"masks must be on {projected.means2d.device}, got {masks.device}")
             mask_shape = tuple(masks.shape[-2:])
             if mask_shape not in accepted:
                 raise ValueError(

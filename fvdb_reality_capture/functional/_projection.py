@@ -31,6 +31,36 @@ def requires_distortion_coeffs(camera_model: CameraModel) -> bool:
     return CameraModel(camera_model) not in (CameraModel.PINHOLE, CameraModel.ORTHOGRAPHIC)
 
 
+def check_distortion_coeffs(
+    distortion_coeffs: torch.Tensor | None, camera_model: CameraModel, num_cameras: int, device: torch.device
+) -> None:
+    """Check packed distortion coefficients for a camera batch before a kernel reads them.
+
+    The kernels read twelve coefficients per camera, so anything else is rejected here rather than
+    rendering wrong pixels or tripping a device assert.
+
+    Args:
+        distortion_coeffs (torch.Tensor | None): Packed coefficients, ``[C, 12]``, or ``None``.
+        camera_model (CameraModel): The batch's camera model; distortion models require the coefficients.
+        num_cameras (int): ``C``.
+        device (torch.device): Device of the Gaussians and cameras.
+
+    Raises:
+        RuntimeError: If a distortion camera model has no coefficients, or the tensor is not a contiguous
+            ``[C, 12]`` tensor on ``device``.
+    """
+    if distortion_coeffs is None:
+        if requires_distortion_coeffs(camera_model):
+            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
+        return
+    if list(distortion_coeffs.shape) != [num_cameras, 12]:
+        raise RuntimeError(f"distortionCoeffs must have shape ({num_cameras}, 12)")
+    if not distortion_coeffs.is_contiguous():
+        raise RuntimeError("distortionCoeffs must be contiguous")
+    if distortion_coeffs.device != device:
+        raise RuntimeError(f"distortionCoeffs must be on {device}, got {distortion_coeffs.device}")
+
+
 def resolve_projection_method(camera_model: CameraModel, projection_method: ProjectionMethod) -> ProjectionMethod:
     """Replace :attr:`~fvdb_reality_capture.ProjectionMethod.AUTO` with the concrete method for a camera model.
 
@@ -112,18 +142,11 @@ def project_gaussians(
         raise RuntimeError("worldToCameraMatrices must be contiguous")
     camera_model = CameraModel(camera_model)
     num_cameras = world_to_camera_matrices.size(0)
-    if distortion_coeffs is not None:
-        if list(distortion_coeffs.shape) != [num_cameras, 12]:
-            raise RuntimeError(f"distortionCoeffs must have shape ({num_cameras}, 12)")
-        if not distortion_coeffs.is_contiguous():
-            raise RuntimeError("distortionCoeffs must be contiguous")
+    check_distortion_coeffs(distortion_coeffs, camera_model, num_cameras, means.device)
 
     resolved = resolve_projection_method(camera_model, projection_method)
-    if requires_distortion_coeffs(camera_model):
-        if resolved != ProjectionMethod.UNSCENTED:
-            raise RuntimeError("OpenCV camera models require ProjectionMethod::UNSCENTED or AUTO")
-        if distortion_coeffs is None:
-            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
+    if requires_distortion_coeffs(camera_model) and resolved != ProjectionMethod.UNSCENTED:
+        raise RuntimeError("OpenCV camera models require ProjectionMethod::UNSCENTED or AUTO")
 
     if resolved == ProjectionMethod.UNSCENTED:
         if distortion_coeffs is None:

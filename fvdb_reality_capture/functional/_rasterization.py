@@ -18,7 +18,7 @@ from ._autograd import (
     _RasterizeWorldSpaceGaussiansFn,
 )
 from ._opacity import check_opacities
-from ._projection import requires_distortion_coeffs
+from ._projection import check_distortion_coeffs
 from ._tile_intersection import check_tiles_match
 from ._types import GaussianTileIntersection, ProjectedGaussians, SparseGaussianTileIntersection
 
@@ -56,6 +56,20 @@ def validate_crop(crop: Crop, image_width: int, image_height: int) -> Crop:
     return origin_w, origin_h, width, height
 
 
+def _finish_dense_render(
+    images: torch.Tensor,
+    alphas: torch.Tensor,
+    crop: Crop | None,
+    masks: torch.Tensor | None,
+    backgrounds: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice a full-size render to its crop, then apply the per-pixel mask over the crop only."""
+    images, alphas = apply_crop(images, alphas, crop)
+    if masks is not None:
+        images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
+    return images, alphas
+
+
 def _render_masks(
     crop: Crop | None,
     masks: torch.Tensor | None,
@@ -78,6 +92,8 @@ def _render_masks(
         expected = (num_cameras, tiles.image_height, tiles.image_width)
         if tuple(masks.shape) != expected:
             raise ValueError(f"masks must be a full-image [C, H, W] mask of shape {expected}, got {tuple(masks.shape)}")
+        if masks.device != device:
+            raise ValueError(f"masks must be on {device}, got {masks.device}")
         masks = masks.bool()
     if crop is None:
         tile_masks = pixel_mask_to_tile_mask(masks, tile_size) if masks is not None else None
@@ -243,11 +259,7 @@ def rasterize_screen_space_gaussians(
             tile_masks,
         ),
     )
-    # Slice first so the pixel-mask pass costs the crop, not the full image.
-    images, alphas = apply_crop(images, alphas, crop)
-    if masks is not None:
-        images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
-    return images, alphas
+    return _finish_dense_render(images, alphas, crop, masks, backgrounds)
 
 
 def rasterize_world_space_gaussians(
@@ -292,9 +304,8 @@ def rasterize_world_space_gaussians(
         alphas (torch.Tensor): Accumulated alpha in ``[0, 1)``, ``[C, H, W, 1]`` (or the crop size).
     """
     opacities = check_opacities(opacities, projected)
+    check_distortion_coeffs(distortion_coeffs, projected.camera_model, projected.num_cameras, opacities.device)
     if distortion_coeffs is None:
-        if requires_distortion_coeffs(projected.camera_model):
-            raise RuntimeError("distortionCoeffs must be provided for OpenCV camera models")
         distortion_coeffs = torch.zeros(
             projected.num_cameras, 12, device=world_to_camera_matrices.device, dtype=world_to_camera_matrices.dtype
         )
@@ -324,11 +335,7 @@ def rasterize_world_space_gaussians(
             tile_masks,
         ),
     )
-    # Slice first so the pixel-mask pass costs the crop, not the full image.
-    images, alphas = apply_crop(images, alphas, crop)
-    if masks is not None:
-        images, alphas = _apply_pixel_mask(images, alphas, _crop_mask(masks, crop), backgrounds)
-    return images, alphas
+    return _finish_dense_render(images, alphas, crop, masks, backgrounds)
 
 
 def rasterize_screen_space_gaussians_sparse(

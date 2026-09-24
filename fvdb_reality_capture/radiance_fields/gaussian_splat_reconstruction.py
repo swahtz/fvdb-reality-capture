@@ -153,6 +153,7 @@ def _train_crop(
     depth_targets: _DepthTargets,
     config: GaussianSplatReconstructionConfig,
     device: torch.device,
+    background: torch.Tensor | None = None,
 ) -> _CropLosses:
     """Render one crop of a training view, compute its losses, and run its backward.
 
@@ -170,6 +171,8 @@ def _train_crop(
         depth_targets (_DepthTargets): Depth supervision of the view, in full-image coordinates.
         config (GaussianSplatReconstructionConfig): Loss weights and options.
         device (torch.device): Device the view renders on.
+        background (torch.Tensor | None): Background color, ``[1, 3]``, composited behind the render. Drawn
+            once per view so every crop of an image is supervised against the same target.
 
     Returns:
         _CropLosses: The detached, weighted loss terms.
@@ -178,9 +181,8 @@ def _train_crop(
     render_outputs = training_view.render_crop(crop)
     image = render_outputs.image
 
-    if config.random_bkgd:
-        bkgd = torch.rand(1, 3, device=device)
-        image = image + bkgd * (1.0 - render_outputs.alpha)
+    if background is not None:
+        image = image + background * (1.0 - render_outputs.alpha)
 
     if mask_pixels is not None:
         # The ground truth takes the rendered value where the mask is off, so those pixels contribute no loss.
@@ -200,29 +202,25 @@ def _train_crop(
             raise NotImplementedError("Sparse depth loss is not implemented for batch_size > 1.")
         if render_outputs.depth is None:
             raise RuntimeError("Model did not render depth channel, but sparse depth loss is enabled.")
-        # The depth points are in full-image pixels while the render covers this crop, so keep the
-        # points inside the crop and index them in crop coordinates.
+        # The depth points are in full-image pixels while the render covers this crop. Points outside the
+        # crop read a clamped pixel and get zero weight, so nothing here syncs with the device.
         crop_x, crop_y, crop_w, crop_h = crop
         u = sparse_depth_uv[0, :, 0].long() - crop_x
         v = sparse_depth_uv[0, :, 1].long() - crop_y
-        in_crop = (u >= 0) & (u < crop_w) & (v >= 0) & (v < crop_h)
-        num_in_crop = int(in_crop.sum())
-        if num_in_crop > 0:
-            u, v = u[in_crop], v[in_crop]
-            depth = render_outputs.depth[..., 0]  # [1, h, w]
-            depth_uv = depth[:, v, u]  # [B, N]
-            alpha_uv = render_outputs.alpha[:, v, u, 0]  # [B, N]
-            pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6)  # [B, N]
-            # Prediction and target are normalized by the median depth.
-            pred_depth = pred_depth / median_depths.unsqueeze(1)
-            target_depth = sparse_depth[:, in_crop] / median_depths.unsqueeze(1)
-            # A mean over this crop's points, weighted by their share of the image's points.
-            sparse_depth_loss = (
-                nnf.l1_loss(pred_depth, target_depth)
-                * config.sparse_depth_reg
-                * (num_in_crop / depth_targets.num_sparse_points)
-            )
-            loss = loss + sparse_depth_loss
+        in_crop = ((u >= 0) & (u < crop_w) & (v >= 0) & (v < crop_h)).to(sparse_depth.dtype)  # [N]
+        u, v = u.clamp(0, crop_w - 1), v.clamp(0, crop_h - 1)
+        depth_uv = render_outputs.depth[..., 0][:, v, u]  # [B, N]
+        alpha_uv = render_outputs.alpha[:, v, u, 0]  # [B, N]
+        # Prediction and target are normalized by the median depth.
+        pred_depth = depth_uv / torch.clamp(alpha_uv, min=1e-6) / median_depths.unsqueeze(1)  # [B, N]
+        target_depth = sparse_depth / median_depths.unsqueeze(1)
+        # The crop's points' share of the full-image mean absolute error.
+        sparse_depth_loss = (
+            ((pred_depth - target_depth).abs() * in_crop).sum()
+            / max(depth_targets.num_sparse_points, 1)
+            * config.sparse_depth_reg
+        )
+        loss = loss + sparse_depth_loss
 
     dense_depth, dense_depth_valid = depth_targets.dense_depth, depth_targets.dense_depth_valid
     num_dense_valid = depth_targets.num_dense_valid
@@ -1615,6 +1613,8 @@ class GaussianSplatReconstruction:
                 ssimloss = torch.zeros((), device=self.device)
                 depth_loss = torch.zeros((), device=self.device)
                 dense_depth_loss = torch.zeros((), device=self.device)
+                # One random background per view, so every crop is supervised against the same target.
+                background = torch.rand(1, 3, device=self.device) if self.config.random_bkgd else None
                 for pixels, mask_pixels, crop, _ in crop_image_batch(image, mask, self.config.crops_per_image):
                     # Renders the crop, computes its losses, and runs its backward; the graph dies on return.
                     crop_losses = _train_crop(
@@ -1626,6 +1626,7 @@ class GaussianSplatReconstruction:
                         depth_targets,
                         self.config,
                         self.device,
+                        background,
                     )
                     image_loss = image_loss + crop_losses.total
                     l1loss = l1loss + crop_losses.l1

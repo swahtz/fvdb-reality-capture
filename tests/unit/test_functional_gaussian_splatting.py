@@ -211,6 +211,12 @@ class TestMatchesGaussianSplat3d(FunctionalPipelineTestCase):
             F.rasterize_world_space_gaussians(
                 means, quats, log_scales, opencv, features.detach(), opacities.detach(), self.w2c, self.K, tiles
             )
+        # The coefficients are checked before the kernel reads twelve per camera.
+        world_args = (means, quats, log_scales, opencv, features.detach(), opacities.detach(), self.w2c, self.K, tiles)
+        with self.assertRaisesRegex(RuntimeError, "shape"):
+            F.rasterize_world_space_gaussians(*world_args, distortion_coeffs=torch.zeros(self.C, 5, device=self.device))
+        with self.assertRaisesRegex(RuntimeError, "must be on"):
+            F.rasterize_world_space_gaussians(*world_args, distortion_coeffs=torch.zeros(self.C, 12))
 
         params_oo = self._params()
         images_oo, alphas_oo = self._model(params_oo).render_images_from_world(
@@ -390,6 +396,14 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         with self.assertRaisesRegex(ValueError, "match the crop"):
             model.render_from_projected_gaussians(
                 pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=float_mask
+            )
+        # A mask on the wrong device is rejected at the same point, not deep inside torch.
+        cpu_full_mask = torch.ones(self.C, self.H, self.W, dtype=torch.bool)
+        with self.assertRaisesRegex(ValueError, "must be on"):
+            F.rasterize_screen_space_gaussians(projected, features, opacities, tiles, masks=cpu_full_mask)
+        with self.assertRaisesRegex(ValueError, "must be on"):
+            model.render_from_projected_gaussians(
+                pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=mask.cpu()
             )
 
     def test_analysis_matches_oo(self):
@@ -849,7 +863,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         without, _ = model.render_from_projected_gaussians(pg, **crop)
         with_tiles, _ = model.render_from_projected_gaussians(pg, tiles=pg_tiles, **crop)
         torch.testing.assert_close(with_tiles, without)
-        # Tiles binned at another size are refused rather than the tile_size argument being ignored.
+        # The tile size comes from the tiles when they are given; an explicit size that disagrees is refused.
+        with_eight, _ = model.render_from_projected_gaussians(pg, tiles=pg.tile_intersection(8), **crop)
+        torch.testing.assert_close(with_eight, without, atol=1e-5, rtol=1e-5)
         with self.assertRaisesRegex(ValueError, "tile_size"):
             model.render_from_projected_gaussians(pg, tiles=pg_tiles, tile_size=8, **crop)
 
