@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol
 
 import torch
 
-from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
+from ..enums import CameraModel, ProjectionMethod
 from ..functional import (
     Crop,
     rasterize_screen_space_gaussians,
@@ -417,12 +417,16 @@ def _project_for_training(
 ) -> ProjectedGaussianSplats:
     """Project one camera batch, with the depth channel when a depth term is on.
 
-    ``accumulate_statistics`` wires the densification accumulators into the projection; the world-space
-    path turns it off so its views do not count as samples (with antialiasing on, the opacity gradient
-    would otherwise reach the analytic projection's backward and bump the step counts).
+    ``accumulate_statistics`` wires the gradient accumulators into the projection; the world-space path
+    turns it off so its views do not count as samples (with antialiasing on, the opacity gradient would
+    otherwise reach the analytic projection's backward and bump the step counts). Radii are recorded either way.
     """
-    render_mode = GaussianRenderMode.FEATURES_AND_DEPTH if _needs_depth_render(config) else GaussianRenderMode.FEATURES
-    return model._project_for(**arguments, render_mode=render_mode, accumulate_statistics=accumulate_statistics)
+    projection_function = (
+        model.project_gaussians_for_images_and_depths
+        if _needs_depth_render(config)
+        else model.project_gaussians_for_images
+    )
+    return projection_function(**arguments, accumulate_statistics=accumulate_statistics)
 
 
 class _ModelRenderBackend:
@@ -663,8 +667,9 @@ def resolve_render_backend(config: "GaussianSplatReconstructionConfig", dataset:
     _logger.warning(
         _forward_only_explanation(forward_only, config)
         + " The run renders every view in world space, which differentiates through the 3D parameters "
-        "directly; Gaussian densification statistics, which only image-space views produce, are unavailable, "
-        "so gradient-driven duplication and splitting are skipped."
+        "directly; the 2D mean-gradient densification statistics, which only image-space views produce, are "
+        "unavailable, so gradient-driven duplication and splitting are skipped while radius-based splitting and "
+        "deletion proceed."
         + _pose_optimization_note(forward_only, config)
         + " Undistort the images to train in image space."
     )

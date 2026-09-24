@@ -89,9 +89,10 @@ def _render_masks(
     the output's coordinates to apply after rendering and slicing (``None`` when no pixel mask was given,
     since slicing to the crop already discards out-of-crop pixels), and the per-tile mask that lets the
     rasterizer skip tiles outside the crop or fully masked out. With a crop, ``masks`` may cover the full
-    image, the crop as requested, or the crop as clipped to the image; either way the tile mask is pooled
-    from it so masked-out tiles are skipped, without building a full-image mask. The tile grid comes from
-    ``tiles`` so it cannot drift from the intersection's.
+    image, the crop as requested, or the crop as clipped to the image (a mask matching both a crop size and
+    the image is read as a crop mask); either way the tile mask is pooled from it so masked-out tiles are
+    skipped, without building a full-image mask. The tile grid comes from ``tiles`` so it cannot drift from
+    the intersection's.
     """
     check_tiles_match(tiles, projected)
     num_cameras = projected.num_cameras
@@ -117,11 +118,12 @@ def _render_masks(
     if masks is None:
         return clipped, None, tile_window
     crop_shape = (num_cameras, height, width)
-    if tuple(masks.shape) == full_shape:
-        crop_mask = _window(masks.bool(), clipped)
-    elif tuple(masks.shape) in (crop_shape, requested_shape):
-        # A mask of the requested crop size covers the clipped part in its top-left corner.
+    if tuple(masks.shape) in (crop_shape, requested_shape):
+        # A mask of the requested crop size covers the clipped part in its top-left corner. This is checked
+        # first: a crop the size of the image is read as a crop mask, never windowed as a full-image one.
         crop_mask = masks[:, :height, :width].bool()
+    elif tuple(masks.shape) == full_shape:
+        crop_mask = _window(masks.bool(), clipped)
     else:
         raise ValueError(
             f"masks must match the image {full_shape}, the crop {requested_shape} or its clipped size {crop_shape}, "

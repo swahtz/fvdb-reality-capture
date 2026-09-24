@@ -696,7 +696,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
     def test_image_space_view_projects_once_and_renders_every_crop_from_it(self):
         model = self._model(self._params())
         with (
-            mock.patch.object(model, "_project_for", wraps=model._project_for) as project,
+            mock.patch.object(
+                model, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+            ) as project,
             mock.patch(
                 "fvdb_reality_capture.radiance_fields.gaussian_splatting.intersect_gaussian_tiles",
                 wraps=F.intersect_gaussian_tiles,
@@ -753,7 +755,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         params = self._params(requires_grad=True)
         model = self._model(params)
         w2c = self.w2c.clone().requires_grad_(True)  # stands in for pose-adjusted cameras
-        with mock.patch.object(GaussianSplat3d, "_project_for", wraps=model._project_for) as project:
+        with mock.patch.object(
+            GaussianSplat3d, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
+        ) as project:
             camera_models, distortion_coeffs = self._camera_batch(CameraModel.PINHOLE)
             view = WorldSpaceRenderBackend().forward_train(
                 model=model,
@@ -795,13 +799,35 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig(antialias=True))
         view.render_crop((0, 0, self.W, self.H)).image.sum().backward()
         view.finish_backward()
-        for accumulator in (
-            model.accumulated_max_2d_radii,
-            model.accumulated_mean_2d_gradient_norms,
-            model.accumulated_gradient_step_counts,
-        ):
+        # The gradient statistics stay untouched, so world-space views never count as samples...
+        for accumulator in (model.accumulated_mean_2d_gradient_norms, model.accumulated_gradient_step_counts):
             self.assertIsNotNone(accumulator)
             self.assertEqual(int(accumulator.abs().sum()), 0)
+        # ... while the radii are recorded from the projection, so radius-based refinement still works.
+        radii = model.accumulated_max_2d_radii
+        self.assertIsNotNone(radii)
+        self.assertGreater(int(radii.max()), 0)
+        # A crop the size of the image at a nonzero origin is read as a crop mask, not windowed as a full one.
+        pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+        crop_mask = torch.zeros(self.C, self.H, self.W, dtype=torch.bool, device=self.device)
+        crop_mask[:, :20, :20] = True
+        shifted, _ = F.rasterize_screen_space_gaussians(
+            pg.projected_gaussians,
+            pg.render_quantities,
+            pg.opacities,
+            pg.tile_intersection(16),
+            masks=crop_mask,
+            crop=(5, 7, self.W, self.H),
+        )
+        plain, _ = F.rasterize_screen_space_gaussians(
+            pg.projected_gaussians,
+            pg.render_quantities,
+            pg.opacities,
+            pg.tile_intersection(16),
+            crop=(5, 7, self.W, self.H),
+        )
+        torch.testing.assert_close(shifted[:, :20, :20], plain[:, :20, :20])
+        self.assertEqual(float(shifted[:, 20:].detach().abs().max()), 0.0)
 
     def test_crops_must_cover_the_ssim_window(self):
         sizes = np.array([[420, 648], [64, 96]])

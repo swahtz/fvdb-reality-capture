@@ -1489,16 +1489,16 @@ class GaussianSplat3d:
         """Stage 1 for this model's Gaussians.
 
         With ``accumulate_statistics`` the enabled densification accumulators are wired into the projection,
-        so its backward records the 2D mean gradients and radii. World-space rasterization does not
-        differentiate through the projected means, so it projects without them and leaves the statistics
-        to the image-space views.
+        so its backward records the 2D mean gradients, step counts and radii. World-space rasterization
+        does not differentiate through the projected means, so it projects with the gradient accumulators
+        left out (its views must not count as samples) and records only the radii, from the forward.
         """
         # The accumulators exist (zeroed) whenever they are enabled, so refinement can read them on every
         # path; world-space rendering leaves the gradient ones out so its views do not count as samples.
         grad_norms, step_counts, max_radii = self._projection_accumulators()
         if not accumulate_statistics:
             grad_norms, step_counts = None, None
-        return project_gaussians(
+        projected = project_gaussians(
             self._means,
             self._quats,
             self._log_scales,
@@ -1518,6 +1518,12 @@ class GaussianSplat3d:
             accumulated_gradient_step_counts=step_counts,
             accumulated_max_2d_radii=max_radii,
         )
+        if not accumulate_statistics and max_radii is not None:
+            # The kernel records radii only inside its gradient-statistics pass, so record them here for
+            # projections that skip it: the largest radius of each Gaussian over the batch, as the kernel does.
+            with torch.no_grad():
+                max_radii.copy_(torch.maximum(max_radii, projected.radii.amax(dim=(0, 2)).to(max_radii.dtype)))
+        return projected
 
     def _project_and_opacities(
         self,
@@ -1537,19 +1543,19 @@ class GaussianSplat3d:
     ) -> tuple[ProjectedGaussians, torch.Tensor]:
         """Stage 1 plus the per-camera opacities every later stage takes, computed once."""
         projected = self._project(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            accumulate_statistics,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            accumulate_statistics=accumulate_statistics,
         )
         return projected, compute_gaussian_opacities(self._logit_opacities, projected)
 
@@ -1589,19 +1595,19 @@ class GaussianSplat3d:
         off, since its views must not count as densification samples.
         """
         projected = self._project(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            accumulate_statistics,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            accumulate_statistics=accumulate_statistics,
         )
         render_quantities = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         return ProjectedGaussianSplats(
@@ -1641,18 +1647,18 @@ class GaussianSplat3d:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """All four stages for dense images, in screen space or world space."""
         projected, opacities = self._project_and_opacities(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
             accumulate_statistics=not world_space,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
@@ -1700,18 +1706,18 @@ class GaussianSplat3d:
     ) -> tuple[JaggedTensor, JaggedTensor]:
         """All four stages for an arbitrary set of pixels, in the requested pixel order."""
         projected, opacities = self._project_and_opacities(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
         )
         features = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         sparse_tiles = intersect_gaussian_tiles_sparse(
@@ -1744,6 +1750,7 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
+        accumulate_statistics: bool = True,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering depth images in those planes.
@@ -1813,6 +1820,10 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
+            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
+                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+                Pass ``False`` for a projection whose render will not differentiate through the projected
+                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1820,20 +1831,21 @@ class GaussianSplat3d:
 
         """
         return self._project_for(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
             sh_degree_to_use=-1,
             render_mode=GaussianRenderMode.DEPTH,
+            accumulate_statistics=accumulate_statistics,
         )
 
     def project_gaussians_for_images(
@@ -1851,6 +1863,7 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
+        accumulate_statistics: bool = True,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images in those planes.
@@ -1920,6 +1933,10 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
+            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
+                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+                Pass ``False`` for a projection whose render will not differentiate through the projected
+                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -1927,20 +1944,21 @@ class GaussianSplat3d:
 
         """
         return self._project_for(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES,
+            accumulate_statistics=accumulate_statistics,
         )
 
     def project_gaussians_for_images_and_depths(
@@ -1958,6 +1976,7 @@ class GaussianSplat3d:
         min_radius_2d: float = 0.0,
         eps_2d: float = 0.3,
         antialias: bool = False,
+        accumulate_statistics: bool = True,
     ) -> ProjectedGaussianSplats:
         """
         Projects this :class:`GaussianSplat3d` onto one or more image planes for rendering multi-channel (see :attr:`num_channels`) images with depths
@@ -2036,6 +2055,10 @@ class GaussianSplat3d:
             eps_2d (float): A value used to pad Gaussians when projecting them onto the image plane, to avoid very projected Gaussians which create artifacts and
                 numerical issues.
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
+            accumulate_statistics (bool): Whether this projection feeds the densification accumulators
+                (:attr:`accumulate_mean_2d_gradients`, :attr:`accumulate_max_2d_radii`) through its backward.
+                Pass ``False`` for a projection whose render will not differentiate through the projected
+                means, as world-space rasterization does not; its radii are still recorded. Default ``True``.
 
         Returns:
             projected_gaussians (ProjectedGaussianSplats): An instance of ProjectedGaussianSplats containing the projected Gaussians.
@@ -2043,20 +2066,21 @@ class GaussianSplat3d:
 
         """
         return self._project_for(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            min_radius_2d,
-            eps_2d,
-            antialias,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
             sh_degree_to_use=sh_degree_to_use,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
+            accumulate_statistics=accumulate_statistics,
         )
 
     def render_from_projected_gaussians(
@@ -2277,22 +2301,22 @@ class GaussianSplat3d:
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            -1,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=-1,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.DEPTH,
             world_space=False,
         )
@@ -2383,23 +2407,23 @@ class GaussianSplat3d:
         """
         pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
-            pixels_jt,
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            -1,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            pixels_to_render=pixels_jt,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=-1,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.DEPTH,
         )
         return self._sparse_result(pixels_to_render, features, alphas)
@@ -2489,22 +2513,22 @@ class GaussianSplat3d:
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES,
             world_space=False,
         )
@@ -2608,22 +2632,22 @@ class GaussianSplat3d:
             alpha_images (torch.Tensor): Alpha images of shape ``(C, H, W, 1)``.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES,
             world_space=True,
             crop=crop,
@@ -2655,22 +2679,22 @@ class GaussianSplat3d:
         same camera-model and projection-method dispatch.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            -1,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=-1,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.DEPTH,
             world_space=True,
             crop=crop,
@@ -2769,23 +2793,23 @@ class GaussianSplat3d:
         """
         pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
-            pixels_jt,
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            pixels_to_render=pixels_jt,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES,
         )
         return self._sparse_result(pixels_to_render, features, alphas)
@@ -2882,23 +2906,23 @@ class GaussianSplat3d:
         """
         pixels_jt = as_pixel_jagged(pixels_to_render)
         features, alphas = self._render_sparse(
-            pixels_jt,
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            pixels_to_render=pixels_jt,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
         )
         return self._sparse_result(pixels_to_render, features, alphas)
@@ -2991,22 +3015,22 @@ class GaussianSplat3d:
                 and 0 means the pixel is fully transparent, and 1 means the pixel is fully opaque.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
             world_space=False,
         )
@@ -3038,22 +3062,22 @@ class GaussianSplat3d:
         final channel while using the same camera-model and projection-method dispatch.
         """
         return self._render_dense(
-            world_to_camera_matrices,
-            projection_matrices,
-            image_width,
-            image_height,
-            near,
-            far,
-            camera_model,
-            projection_method,
-            distortion_coeffs,
-            sh_degree_to_use,
-            tile_size,
-            min_radius_2d,
-            eps_2d,
-            antialias,
-            backgrounds,
-            masks,
+            world_to_camera_matrices=world_to_camera_matrices,
+            projection_matrices=projection_matrices,
+            image_width=image_width,
+            image_height=image_height,
+            near=near,
+            far=far,
+            camera_model=camera_model,
+            projection_method=projection_method,
+            distortion_coeffs=distortion_coeffs,
+            sh_degree_to_use=sh_degree_to_use,
+            tile_size=tile_size,
+            min_radius_2d=min_radius_2d,
+            eps_2d=eps_2d,
+            antialias=antialias,
+            backgrounds=backgrounds,
+            masks=masks,
             render_mode=GaussianRenderMode.FEATURES_AND_DEPTH,
             world_space=True,
             crop=crop,
@@ -3140,18 +3164,18 @@ class GaussianSplat3d:
         """
         with torch.no_grad():
             projected, opacities = self._project_and_opacities(
-                world_to_camera_matrices,
-                projection_matrices,
-                image_width,
-                image_height,
-                near,
-                far,
-                camera_model,
-                projection_method,
-                distortion_coeffs,
-                min_radius_2d,
-                eps_2d,
-                antialias,
+                world_to_camera_matrices=world_to_camera_matrices,
+                projection_matrices=projection_matrices,
+                image_width=image_width,
+                image_height=image_height,
+                near=near,
+                far=far,
+                camera_model=camera_model,
+                projection_method=projection_method,
+                distortion_coeffs=distortion_coeffs,
+                min_radius_2d=min_radius_2d,
+                eps_2d=eps_2d,
+                antialias=antialias,
             )
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
             return rasterize_num_contributing_gaussians(projected, opacities, tiles)
@@ -3261,18 +3285,18 @@ class GaussianSplat3d:
         pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
             projected, opacities = self._project_and_opacities(
-                world_to_camera_matrices,
-                projection_matrices,
-                image_width,
-                image_height,
-                near,
-                far,
-                camera_model,
-                projection_method,
-                distortion_coeffs,
-                min_radius_2d,
-                eps_2d,
-                antialias,
+                world_to_camera_matrices=world_to_camera_matrices,
+                projection_matrices=projection_matrices,
+                image_width=image_width,
+                image_height=image_height,
+                near=near,
+                far=far,
+                camera_model=camera_model,
+                projection_method=projection_method,
+                distortion_coeffs=distortion_coeffs,
+                min_radius_2d=min_radius_2d,
+                eps_2d=eps_2d,
+                antialias=antialias,
             )
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities
@@ -3336,18 +3360,18 @@ class GaussianSplat3d:
         """
         with torch.no_grad():
             projected, opacities = self._project_and_opacities(
-                world_to_camera_matrices,
-                projection_matrices,
-                image_width,
-                image_height,
-                near,
-                far,
-                camera_model,
-                projection_method,
-                distortion_coeffs,
-                min_radius_2d,
-                eps_2d,
-                antialias,
+                world_to_camera_matrices=world_to_camera_matrices,
+                projection_matrices=projection_matrices,
+                image_width=image_width,
+                image_height=image_height,
+                near=near,
+                far=far,
+                camera_model=camera_model,
+                projection_method=projection_method,
+                distortion_coeffs=distortion_coeffs,
+                min_radius_2d=min_radius_2d,
+                eps_2d=eps_2d,
+                antialias=antialias,
             )
             tiles = intersect_gaussian_tiles(projected, tile_size=tile_size, opacities=opacities)
             return rasterize_contributing_gaussian_ids(projected, opacities, tiles, top_k_contributors)
@@ -3456,18 +3480,18 @@ class GaussianSplat3d:
         pixels_jt = as_pixel_jagged(pixels_to_render)
         with torch.no_grad():
             projected, opacities = self._project_and_opacities(
-                world_to_camera_matrices,
-                projection_matrices,
-                image_width,
-                image_height,
-                near,
-                far,
-                camera_model,
-                projection_method,
-                distortion_coeffs,
-                min_radius_2d,
-                eps_2d,
-                antialias,
+                world_to_camera_matrices=world_to_camera_matrices,
+                projection_matrices=projection_matrices,
+                image_width=image_width,
+                image_height=image_height,
+                near=near,
+                far=far,
+                camera_model=camera_model,
+                projection_method=projection_method,
+                distortion_coeffs=distortion_coeffs,
+                min_radius_2d=min_radius_2d,
+                eps_2d=eps_2d,
+                antialias=antialias,
             )
             sparse_tiles = intersect_gaussian_tiles_sparse(
                 pixels_jt, projected, tile_size=tile_size, opacities=opacities

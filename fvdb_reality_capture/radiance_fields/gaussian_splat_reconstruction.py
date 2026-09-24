@@ -366,6 +366,8 @@ class GaussianSplatReconstructionConfig:
     computed per crop with zero padding, so its windows along crop seams do not see the neighbouring crop;
     the scale-and-shift-invariant dense depth loss fits its scale and shift per crop rather than per image;
     and rows or columns left over when the image size is not divisible by this count are not supervised.
+    Regularization and the pose penalty are applied once per image rather than once per crop, so their
+    weight relative to the image loss no longer grows with the square of this count.
     Every crop must be at least 11 pixels on a side, the SSIM window, or training raises.
     The raster output buffers are still allocated at full image size (openvdb/fvdb-core#800), so it
     reduces peak memory less than the crop area alone would suggest.
