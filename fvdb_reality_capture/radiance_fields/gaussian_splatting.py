@@ -1581,8 +1581,13 @@ class GaussianSplat3d:
         antialias: bool,
         sh_degree_to_use: int,
         render_mode: GaussianRenderMode,
+        accumulate_statistics: bool = True,
     ) -> ProjectedGaussianSplats:
-        """Stages 1 and 2, bundled for later rendering with :meth:`render_from_projected_gaussians`."""
+        """Stages 1 and 2, bundled for later rendering with :meth:`render_from_projected_gaussians`.
+
+        ``accumulate_statistics`` is passed to :meth:`_project`; the world-space training path turns it
+        off, since its views must not count as densification samples.
+        """
         projected = self._project(
             world_to_camera_matrices,
             projection_matrices,
@@ -1596,6 +1601,7 @@ class GaussianSplat3d:
             min_radius_2d,
             eps_2d,
             antialias,
+            accumulate_statistics,
         )
         render_quantities = self._features(projected, world_to_camera_matrices, sh_degree_to_use, render_mode)
         return ProjectedGaussianSplats(
@@ -2140,9 +2146,9 @@ class GaussianSplat3d:
                 this parameter unless you really know what you are doing.
             backgrounds (torch.Tensor | None): Optional background colors of shape ``(C, D)``.
                 If ``None``, background is treated as 0.
-            masks (torch.Tensor | None): Optional per-pixel boolean mask of shape ``(C, cropH, cropW)``
-                (in crop coordinate space, matching the output dimensions), on the projection's device.
-                ``True`` means render, ``False`` means skip (filled with background).
+            masks (torch.Tensor | None): Optional per-pixel boolean mask in crop coordinates, of the requested
+                crop size ``(C, cropH, cropW)`` or of its size after clipping to the image, on the projection's
+                device. ``True`` means render, ``False`` means skip (filled with background).
             tiles (GaussianTileIntersection | None): The tile intersections of ``projected_gaussians`` at
                 ``tile_size``, from :meth:`ProjectedGaussianSplats.tile_intersection`. Computed here when
                 ``None``. Pass them when rendering several crops from one projection, so the Gaussians are
@@ -2173,24 +2179,10 @@ class GaussianSplat3d:
             tile_size = tiles.tile_size
         elif tile_size is None:
             tile_size = 16
-        crop = None
-        if is_crop:
-            # The stage function clips the crop at the image edge (to nothing, if it lies entirely outside)
-            # and returns the clipped part; it is padded back below, so the output has the requested size.
-            crop = (origin_w, origin_h, crop_w, crop_h)
-            clipped = validate_crop(crop, width, height)
-            if masks is not None:
-                # The mask is in crop coordinates. Accept the requested or the clipped crop size; anything
-                # else (a full-image mask, say) would silently be read from its top-left corner.
-                if masks.device != projected.means2d.device:
-                    raise ValueError(f"masks must be on {projected.means2d.device}, got {masks.device}")
-                mask_shape = tuple(masks.shape[-2:])
-                if mask_shape not in ((requested_h, requested_w), (clipped[3], clipped[2])):
-                    raise ValueError(
-                        f"masks must match the crop {(requested_h, requested_w)} or its clipped size "
-                        f"{(clipped[3], clipped[2])}, got {mask_shape}"
-                    )
-                masks = masks[:, : clipped[3], : clipped[2]]
+        # The stage function clips the crop at the image edge (to nothing, if it lies entirely outside),
+        # checks the mask against the requested or clipped crop size, and returns the clipped part; it is
+        # padded back below, so the output has the requested size.
+        crop = (origin_w, origin_h, crop_w, crop_h) if is_crop else None
         images, alphas = rasterize_screen_space_gaussians(
             projected,
             pg.render_quantities,
@@ -2609,7 +2601,7 @@ class GaussianSplat3d:
 
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
-                the output has the clipped size. A crop entirely outside the image raises.
+                the output has the clipped size; a crop entirely outside the image gives an empty render.
 
         Returns:
             images (torch.Tensor): Rendered images of shape ``(C, H, W, D)``.
@@ -2764,7 +2756,7 @@ class GaussianSplat3d:
                 with zero alpha.
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
-                the output has the clipped size. A crop entirely outside the image raises.
+                the output has the clipped size; a crop entirely outside the image gives an empty render.
 
         Returns:
             features (torch.Tensor | JaggedTensor): A tensor of shape ``(C, P, D)`` or a
@@ -3135,7 +3127,7 @@ class GaussianSplat3d:
             antialias (bool): If ``True``, applies opacity correction to the projected Gaussians when using ``eps_2d > 0.0``.
             crop (tuple[int, int, int, int] | None): Optional ``(origin_w, origin_h, width, height)`` window
                 to render instead of the full image, clipped to the image; tiles outside it are skipped and
-                the output has the clipped size. A crop entirely outside the image raises.
+                the output has the clipped size; a crop entirely outside the image gives an empty render.
 
         Returns:
             images (torch.Tensor): A tensor of shape ``(C, H, W, 1)`` where ``C`` is the number of camera views,

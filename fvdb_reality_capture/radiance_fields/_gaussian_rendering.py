@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol
 
 import torch
 
-from ..enums import CameraModel, ProjectionMethod
+from ..enums import CameraModel, GaussianRenderMode, ProjectionMethod
 from ..functional import (
     Crop,
     rasterize_screen_space_gaussians,
@@ -130,10 +130,12 @@ class _WorldSpaceTrainingView:
     """World-space view: projection, features, opacities and tiles are computed once, each crop rasterizes.
 
     The world-space rasterizer differentiates through the 3D parameters directly, so the crops reach
-    ``means``, ``quats`` and ``log_scales`` on their own. Features, opacities and the camera matrices are
-    the shared inputs (the features carry the spherical-harmonics graph, the cameras the pose-adjustment
-    one), so the crops rasterize from detached copies of them and :meth:`finish_backward` propagates
-    their accumulated gradients once.
+    ``means``, ``quats`` and ``log_scales`` on their own. Features and opacities are the shared inputs
+    (the features carry the spherical-harmonics graph, and through it the pose-adjustment graph), so the
+    crops rasterize from detached copies of them and :meth:`finish_backward` propagates their accumulated
+    gradients once. The rasterizer returns no gradient for the camera matrices, so they are passed
+    detached; passing them with their graph would make each crop's backward walk, and free, the
+    pose-adjustment graph the features still need.
     """
 
     def __init__(
@@ -148,15 +150,10 @@ class _WorldSpaceTrainingView:
     ) -> None:
         self._model = model
         self._projected = projected_gaussians.projected_gaussians
-        self._shared = _SharedWork(
-            [
-                projected_gaussians.render_quantities,
-                projected_gaussians.opacities,
-                world_to_camera_matrices,
-                projection_matrices,
-            ]
-        )
-        self._features, self._opacities, self._world_to_camera, self._projection = self._shared.leaves
+        self._shared = _SharedWork([projected_gaussians.render_quantities, projected_gaussians.opacities])
+        self._features, self._opacities = self._shared.leaves
+        self._world_to_camera = world_to_camera_matrices.detach()
+        self._projection = projection_matrices.detach()
         self._distortion_coeffs = distortion_coeffs
         self._tiles = projected_gaussians.tile_intersection(tile_size)
         self._num_channels = num_channels
@@ -413,15 +410,19 @@ class RenderBackend(Protocol):
 
 
 def _project_for_training(
-    model: GaussianSplat3d, config: "GaussianSplatReconstructionConfig", arguments: dict[str, Any]
+    model: GaussianSplat3d,
+    config: "GaussianSplatReconstructionConfig",
+    arguments: dict[str, Any],
+    accumulate_statistics: bool = True,
 ) -> ProjectedGaussianSplats:
-    """Project one camera batch, with the depth channel when a depth term is on."""
-    projection_function = (
-        model.project_gaussians_for_images_and_depths
-        if _needs_depth_render(config)
-        else model.project_gaussians_for_images
-    )
-    return projection_function(**arguments)
+    """Project one camera batch, with the depth channel when a depth term is on.
+
+    ``accumulate_statistics`` wires the densification accumulators into the projection; the world-space
+    path turns it off so its views do not count as samples (with antialiasing on, the opacity gradient
+    would otherwise reach the analytic projection's backward and bump the step counts).
+    """
+    render_mode = GaussianRenderMode.FEATURES_AND_DEPTH if _needs_depth_render(config) else GaussianRenderMode.FEATURES
+    return model._project_for(**arguments, render_mode=render_mode, accumulate_statistics=accumulate_statistics)
 
 
 class _ModelRenderBackend:
@@ -613,7 +614,7 @@ class WorldSpaceRenderBackend(_ModelRenderBackend):
         # The shared stages run once here; each crop only rasterizes, as in image space.
         return _WorldSpaceTrainingView(
             model,
-            _project_for_training(model, config, arguments),
+            _project_for_training(model, config, arguments, accumulate_statistics=False),
             arguments["world_to_camera_matrices"],
             arguments["projection_matrices"],
             arguments["distortion_coeffs"],

@@ -424,14 +424,14 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         )
         torch.testing.assert_close(stage_masked, masked, atol=1e-5, rtol=1e-5)
         # A mask of any other size is rejected rather than read from its top-left corner; the class
-        # method takes the requested or the clipped crop size only.
-        with self.assertRaisesRegex(ValueError, "full-image mask .* or a crop mask"):
+        # method hands its crop-space mask to the same check.
+        with self.assertRaisesRegex(ValueError, "match the image .* the crop .* clipped size"):
             F.rasterize_screen_space_gaussians(
                 projected, features, opacities, tiles, masks=mask[:, :-1], crop=(ox, oy, w, h)
             )
-        with self.assertRaisesRegex(ValueError, "match the crop"):
+        with self.assertRaisesRegex(ValueError, "clipped size"):
             model.render_from_projected_gaussians(
-                pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=float_mask
+                pg, crop_width=w, crop_height=h, crop_origin_w=ox, crop_origin_h=oy, masks=mask[:, :-1]
             )
         # A mask on the wrong device is rejected at the same point, not deep inside torch.
         cpu_full_mask = torch.ones(self.C, self.H, self.W, dtype=torch.bool)
@@ -622,8 +622,8 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         self.assertTrue(grads)
         self.assertTrue(all(float(g.abs().max()) == 0.0 for g in grads))
         with torch.no_grad():
-            pg = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
-            images, alphas = model.render_from_projected_gaussians(pg, **outside)
+            frozen = model.project_gaussians_for_images(self.w2c, self.K, self.W, self.H, 0.01, 1e10)
+            images, alphas = model.render_from_projected_gaussians(frozen, **outside)
         self.assertFalse(images.requires_grad)
         self.assertFalse(alphas.requires_grad)
         # The stage function has the same contract minus the padding: an all-outside crop is empty.
@@ -636,9 +636,11 @@ class TestSparseAndCrop(FunctionalPipelineTestCase):
         )
         self.assertEqual(tuple(empty.shape), (self.C, 0, 0, 3))
         self.assertEqual(tuple(empty_alpha.shape), (self.C, 0, 0, 1))
+        # ... and short-circuits the rasterizer while staying connected to the features.
+        self.assertTrue(empty.requires_grad)
         # A mask of the wrong shape is rejected for an outside crop just as for any other crop.
         bad_mask = torch.ones(self.C, 3, 3, dtype=torch.bool, device=self.device)
-        with self.assertRaisesRegex(ValueError, "masks must match"):
+        with self.assertRaisesRegex(ValueError, "clipped size"):
             model.render_from_projected_gaussians(pg, masks=bad_mask, **outside)
         good_mask = torch.ones(self.C, 10, 10, dtype=torch.bool, device=self.device)
         images, _ = model.render_from_projected_gaussians(pg, masks=good_mask, **outside)
@@ -694,9 +696,7 @@ class TestRenderBackends(FunctionalPipelineTestCase):
     def test_image_space_view_projects_once_and_renders_every_crop_from_it(self):
         model = self._model(self._params())
         with (
-            mock.patch.object(
-                model, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
-            ) as project,
+            mock.patch.object(model, "_project_for", wraps=model._project_for) as project,
             mock.patch(
                 "fvdb_reality_capture.radiance_fields.gaussian_splatting.intersect_gaussian_tiles",
                 wraps=F.intersect_gaussian_tiles,
@@ -753,9 +753,7 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         params = self._params(requires_grad=True)
         model = self._model(params)
         w2c = self.w2c.clone().requires_grad_(True)  # stands in for pose-adjusted cameras
-        with mock.patch.object(
-            GaussianSplat3d, "project_gaussians_for_images", wraps=model.project_gaussians_for_images
-        ) as project:
+        with mock.patch.object(GaussianSplat3d, "_project_for", wraps=model._project_for) as project:
             camera_models, distortion_coeffs = self._camera_batch(CameraModel.PINHOLE)
             view = WorldSpaceRenderBackend().forward_train(
                 model=model,
@@ -792,7 +790,9 @@ class TestRenderBackends(FunctionalPipelineTestCase):
         model = self._model(self._params(requires_grad=True))
         model.accumulate_mean_2d_gradients = True
         model.accumulate_max_2d_radii = True
-        view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig())
+        # With antialiasing the opacity gradient reaches the analytic projection's backward, which would
+        # bump the step counts if the world-space projection wired the accumulators in.
+        view = self._forward_train(WorldSpaceRenderBackend(), model, GaussianSplatReconstructionConfig(antialias=True))
         view.render_crop((0, 0, self.W, self.H)).image.sum().backward()
         view.finish_backward()
         for accumulator in (
